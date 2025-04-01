@@ -8,6 +8,10 @@ TaxonTableTools2 (TTT) aims to provide easy to use tools for biologists and non-
 
 TaxonTableTools is an evolving software and there will be bugs and issues at few points. If so, please leave the report in the git repository or drop me an email. Furthermore, new content and functions will be gradually added. Suggestions and recommendations for new features are always welcome!
 
+## Version 2
+
+TaxonTableTools2 has transitioned from PySimpleGUI to Streamlit for its graphical user interface! This shift required a complete rewrite of TTT from the ground up, so the current version may be significantly buggier than previous releases. More stable versions are planned for release throughout 2025.
+
 ## Requirements
 
 * Miniconda
