@@ -20,7 +20,7 @@ TaxonTableTools is an evolving software and there will be bugs and issues at few
    - **Windows**: Type 'Anaconda' in your search bar and select 'Anaconda Powershell Prompt (miniconda3)'.
    - **MacOS**: Open a new terminal. You will see the (base) environment before your user name.
 
-3. Download the respective environment installation file for Windows or MacOS (coming soon).
+3. Download the respective environment installation file for Windows or [MacOS](https://github.com/TillMacher/TaxonTableTools2/blob/main/environments/taxontabletools_env_macos_aarch64.yml).
 
 4. Install the metabarcoding environment by typing:
    ```sh
