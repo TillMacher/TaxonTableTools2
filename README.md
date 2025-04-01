@@ -8,6 +8,10 @@ TaxonTableTools2 (TTT) aims to provide easy to use tools for biologists and non-
 
 TaxonTableTools is an evolving software and there will be bugs and issues at few points. If so, please leave the report in the git repository or drop me an email. Furthermore, new content and functions will be gradually added. Suggestions and recommendations for new features are always welcome!
 
+## Version 2
+
+TaxonTableTools2 has transitioned from PySimpleGUI to Streamlit for its graphical user interface! This shift required a complete rewrite of TTT from the ground up, so the current version may be significantly buggier than previous releases. More stable versions are planned for release throughout 2025.
+
 ## Requirements
 
 * Miniconda
@@ -20,21 +24,17 @@ TaxonTableTools is an evolving software and there will be bugs and issues at few
    - **Windows**: Type 'Anaconda' in your search bar and select 'Anaconda Powershell Prompt (miniconda3)'.
    - **MacOS**: Open a new terminal. You will see the (base) environment before your user name.
 
-3. Download the respective environment installation file for Windows or MacOS (coming soon).
+3. Download the respective environment installation file for Windows or [MacOS](https://github.com/TillMacher/TaxonTableTools2/blob/main/environments/taxontabletools_env_macos_aarch64.yml).
 
 4. Install the metabarcoding environment by typing:
    ```sh
-   conda env create -f taxontabletools2_env_windows_aarch64.yml
-   
-5. Ensure you provide the correct path, for example:
-   ```sh
    conda env create -f /Users/tillmacher/Downloads/taxontabletools2_env_windows_aarch64.yml
    
-6. This should automatically install all dependencies. After the installation, activate the environment:
+5. This should automatically install all dependencies. After the installation, activate the environment:
    ```sh
    conda activate TTT
 
-7. To update TaxonTableTools2 type:
+6. To update TaxonTableTools2 type:
       ```sh
    pip install --upgrade taxontabletools2
 
