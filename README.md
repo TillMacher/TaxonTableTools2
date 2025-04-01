@@ -10,17 +10,35 @@ TaxonTableTools is an evolving software and there will be bugs and issues at few
 
 ## Requirements
 
-* Python version 3.12 or higher
+* Miniconda
 
-## Installation
+## Miniconda Installation
 
-* coming soon
+1. Install Miniconda by following the instructions.
+
+2. Open a new Anaconda (Miniconda3) terminal.
+   - **Windows**: Type 'Anaconda' in your search bar and select 'Anaconda Powershell Prompt (miniconda3)'.
+   - **MacOS**: Open a new terminal. You will see the (base) environment before your user name.
+
+3. Download the respective environment installation file for Windows or MacOS (coming soon).
+
+4. Install the metabarcoding environment by typing:
+   ```sh
+   conda env create -f taxontabletools2_env_windows_aarch64.yml
+   
+5. Ensure you provide the correct path, for example:
+   ```sh
+   conda env create -f /Users/tillmacher/Downloads/taxontabletools2_env_windows_aarch64.yml
+   
+6. This should automatically install all dependencies. After the installation, activate the environment:
+   ```sh
+   conda activate TTT
+
+7. To update TaxonTableTools2 type:
+      ```sh
+   pip install --upgrade taxontabletools2
 
 ## Tutorial
-
-* coming soon
-
-## Quick start
 
 * coming soon
 
