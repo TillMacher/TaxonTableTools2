@@ -1,0 +1,15 @@
+matplotlib==3.6.3
+matplotlib_venn==0.11.7
+numpy==2.1.3
+pandas==2.2.3
+plotly==5.9.0
+psutil==5.9.4
+pymannkendall==1.4.3
+Requests==2.32.3
+scikit_bio==0.5.8
+scipy==1.14.1
+seqconverter==3.1.0
+statsmodels==0.13.5
+stqdm==0.0.5
+streamlit==1.25.0
+update_checker==0.18.0
