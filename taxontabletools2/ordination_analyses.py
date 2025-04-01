@@ -8,6 +8,9 @@ from scipy.spatial.distance import pdist, squareform
 from scipy.spatial import ConvexHull
 import streamlit as st
 import plotly.colors
+from skbio.stats.ordination import pcoa
+from skbio import DistanceMatrix
+from skbio.stats.distance import anosim
 
 def pcoa_analysis(path_to_outdirs, taxon_table_xlsx, taxon_table_df, samples, metadata_df, selected_metadata, traits_df, selected_traits, user_settings, tool_settings):
 
@@ -78,51 +81,36 @@ def pcoa_analysis(path_to_outdirs, taxon_table_xlsx, taxon_table_df, samples, me
     # Convert to a DataFrame for easier manipulation
     distance_matrix_df = pd.DataFrame(distance_matrix, index=samples, columns=samples)
 
-    # Try to import skbio (which is difficult to install)
-    try:
-        from skbio.stats.ordination import pcoa
-        from skbio import DistanceMatrix
-        from skbio.stats.distance import anosim
-        skbio = True
-    except ImportError:
-        skbio = False
+    # Calculate pcoa
+    pcoa_res = pcoa(distance_matrix_df)
 
-    # Only continue if skbio is installed
-    if skbio == True:
+    # Collect expained variance
+    pcoa_explained_variance_df = pd.DataFrame(pcoa_res.proportion_explained, columns=['explained_variance'])*100
+    pcoa_explained_variance_df = pcoa_explained_variance_df[pcoa_explained_variance_df['explained_variance'] > 1]
 
-        # Calculate pcoa
-        pcoa_res = pcoa(distance_matrix_df)
+    # Collect values and already filter for PC axes with >1% explained variance
+    pcoa_df = pd.DataFrame(pcoa_res.samples)
+    pcoa_df.index=samples
+    pcoa_axes = list(pcoa_explained_variance_df.index)
+    pcoa_df = pcoa_df[pcoa_axes]
+    pcoa_df['Color'] = sample_colors
+    pcoa_df['Metadata'] = sample_categories
 
-        # Collect expained variance
-        pcoa_explained_variance_df = pd.DataFrame(pcoa_res.proportion_explained, columns=['explained_variance'])*100
-        pcoa_explained_variance_df = pcoa_explained_variance_df[pcoa_explained_variance_df['explained_variance'] > 1]
+    # Create a dict for display and to draw from later
+    axes_dict = pcoa_explained_variance_df.to_dict()['explained_variance']
 
-        # Collect values and already filter for PC axes with >1% explained variance
-        pcoa_df = pd.DataFrame(pcoa_res.samples)
-        pcoa_df.index=samples
-        pcoa_axes = list(pcoa_explained_variance_df.index)
-        pcoa_df = pcoa_df[pcoa_axes]
-        pcoa_df['Color'] = sample_colors
-        pcoa_df['Metadata'] = sample_categories
+    # Calculate anosim
+    # Calculate ANOSIM if specific metadata is selected
+    anosim_result = None
+    if selected_metadata != 'All samples':
+        # Create DistanceMatrix object for ANOSIM
+        dm = DistanceMatrix(distance_matrix)
 
-        # Create a dict for display and to draw from later
-        axes_dict = pcoa_explained_variance_df.to_dict()['explained_variance']
+        # Perform ANOSIM using the selected metadata as grouping variable
+        result = anosim(dm, sample_categories, permutations=999)
+        anosim_result = result  # Store the ANOSIM result
 
-        # Calculate anosim
-        # Calculate ANOSIM if specific metadata is selected
-        anosim_result = None
-        if selected_metadata != 'All samples':
-            # Create DistanceMatrix object for ANOSIM
-            dm = DistanceMatrix(distance_matrix)
-
-            # Perform ANOSIM using the selected metadata as grouping variable
-            result = anosim(dm, sample_categories, permutations=999)
-            anosim_result = result  # Store the ANOSIM result
-
-        return pcoa_df, axes_dict, anosim_result, selected_metadata
-
-    else:
-        st.error('Please install skbio to calculate PCoAs!')
+    return pcoa_df, axes_dict, anosim_result, selected_metadata
 
 def draw_outlines(fig, x_values, y_values, metadata, color):
     ## collect samples that form the outline
