@@ -24,7 +24,7 @@ TaxonTableTools2 has transitioned from PySimpleGUI to Streamlit for its graphica
    - **Windows**: Type 'Anaconda' in your search bar and select 'Anaconda Powershell Prompt (miniconda3)'.
    - **MacOS**: Open a new terminal. You will see the (base) environment before your user name.
 
-3. Download the respective environment installation file for Windows or [MacOS](https://github.com/TillMacher/TaxonTableTools2/blob/main/environments/taxontabletools_env_macos_aarch64.yml).
+3. Download the respective environment installation file for [Windows](https://github.com/TillMacher/TaxonTableTools2/blob/main/environments/taxontabletools2_env_windows_aarch64.yml) or [MacOS](https://github.com/TillMacher/TaxonTableTools2/blob/main/environments/taxontabletools2_env_macos_aarch64.yml).
 
 4. Install the metabarcoding environment by typing:
    ```sh
