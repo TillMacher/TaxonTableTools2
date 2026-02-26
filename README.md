@@ -28,6 +28,14 @@ TaxonTableTools2 has transitioned from PySimpleGUI to Streamlit for its graphica
    ```sh
    conda env create -f taxontabletools2_env_windows_aarch64.yml
 
+5. Activate the TTT environment by typing:
+   ```sh
+   conda activate TTT
+
+6. Start TTT by typing:
+   ```sh
+   taxontabletools2
+
 ## Tutorial
 
 * coming soon
