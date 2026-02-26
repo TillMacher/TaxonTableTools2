@@ -1,49 +1,97 @@
-# TaxonTableTools2
+# TaxonTableTools2 (TTT)
 
-## Background
+## Overview
 
-TaxonTableTools2 (TTT) aims to provide easy to use tools for biologists and non-bioinformaticians to analyse and visualize their DNA metabarcoding data quickly and reproducible via a graphical user interface.
+TaxonTableTools2 (TTT) is an easy-to-use graphical software designed for
+the analysis and visualization of DNA metabarcoding data. It enables
+biologists and researchers without bioinformatics experience to explore
+taxonomic datasets quickly, reproducibly, and interactively through a
+modern graphical user interface.
 
-TaxonTableTools is an evolving software and there will be bugs and issues at few points. If so, please leave the report in the git repository or drop me an email. Furthermore, new content and functions will be gradually added. Suggestions and recommendations for new features are always welcome!
+TTT focuses on:
+* Intuitive biodiversity data exploration
+* Reproducible analysis workflows
+* Rapid visualization of metabarcoding results
+* Accessibility for non-programmers
 
-## Version 2
+## Version 2 – Streamlit-based GUI
 
-TaxonTableTools2 has transitioned from PySimpleGUI to Streamlit for its graphical user interface! This shift required a complete rewrite of TTT from the ground up, so the current version may be significantly buggier than previous releases. More stable versions are planned for release throughout 2026.
+TaxonTableTools2 represents a complete redesign of the original
+TaxonTableTools software.
+
+Because Version 2 was rewritten from the ground up, early releases may
+still contain bugs or incomplete features. Stability and functionality
+will continue to improve throughout 2026.
+
+Bug reports, feature requests, and suggestions are highly welcome.
 
 ## Requirements
+* Python3.12 or higher
+* Miniconda (recommended)
+* Windows (W10 or W11)
+* macOS (M1 or M2)
+* Linux requires a manual installation via pip
 
-* Miniconda
+## Installation
 
-## Miniconda Installation
+1.  Download and install [Miniconda](https://www.anaconda.com/download/success)
 
-1. Install Miniconda by following the instructions.
+2.  Open a Miniconda Terminal
 
-2. Open a new Anaconda (Miniconda3) terminal.
-   - **Windows**: Type 'Anaconda' in your search bar and select 'Anaconda Powershell Prompt (miniconda3)'.
-   - **MacOS**: Open a new terminal. You will see the (base) environment before your user name.
+Windows: Search for ‘Anaconda Powershell Prompt (Miniconda3)’
 
-3. Download the respective environment installation file for [Windows](https://github.com/TillMacher/TaxonTableTools2/blob/main/environments/taxontabletools2_env_windows_aarch64.yml) or [MacOS](https://github.com/TillMacher/TaxonTableTools2/blob/main/environments/taxontabletools2_env_macos_aarch64.yml).
+macOS: Open a new Terminal window. The prompt should display the (base)
+environment.
 
-4. Install the TTT environment by typing:
+3.  Download the TTT Environment File
+
+* [Windows](https://github.com/TillMacher/TaxonTableTools2/blob/main/environments/taxontabletools2_env_windows_aarch64.yml)
+* [macOS](https://github.com/TillMacher/TaxonTableTools2/blob/main/environments/taxontabletools2_env_macos_aarch64.yml)
+
+4.  Create the TTT Environment (remember to adjust the PATH to match your local file!)
    ```sh
    conda env create -f taxontabletools2_env_windows_aarch64.yml
+   ```
 
-5. Activate the TTT environment by typing:
+5.  Activate the Environment
    ```sh
    conda activate TTT
+   ```
 
-6. Start TTT by typing:
+6.  Start TaxonTableTools2
    ```sh
    taxontabletools2
+   ```
+
+Your browser will automatically open the graphical user interface.
 
 ## Tutorial
 
-* coming soon
+Documentation and tutorials are currently under development and will be
+released soon.
 
-## How to cite
+## Reporting Issues
 
-If you use TTT:
-* Macher, T.*H., Beermann, A. J., & Leese, F. (2021). TaxonTableTools—A comprehensive, platform*independent graphical user interface software to explore and visualise DNA metabarcoding data. Molecular Ecology Resources. doi: https://doi.org/10.1111/1755*0998.13358
+If you encounter bugs or unexpected behaviour:
+* open an issue in the GitHub repository
+* contact me directly via email
 
-If you create Krona charts, please also cite:
-* Ondov, B. D., Bergman, N. H., & Phillippy, A. M. (2011). Interactive metagenomic visualization in a Web browser. BMC Bioinformatics, 12(1), 385. doi: 10.1186/1471*2105*12*385
+Community feedback strongly contributes to improving TTT.
+
+## Citation
+
+If you use TaxonTableTools in your research, please cite:
+
+Macher, T. H., Beermann, A. J., & Leese, F. (2021). TaxonTableTools—A
+comprehensive, platform-independent graphical user interface software to
+explore and visualise DNA metabarcoding data. Molecular Ecology
+Resources. https://doi.org/10.1111/1755-0998.13358
+
+
+## Development Status
+
+TaxonTableTools2 is actively developed and evolving. New analysis
+modules, visualization tools, and workflow improvements will be added
+continuously.
+
+Contributions and collaborations are welcome.
