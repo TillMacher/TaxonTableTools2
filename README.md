@@ -1,7 +1,5 @@
 # TaxonTableTools2
 
-[![Downloads](https://pepy.tech/badge/taxontabletools2)](https://pepy.tech/project/taxontabletools2)
-
 ## Background
 
 TaxonTableTools2 (TTT) aims to provide easy to use tools for biologists and non-bioinformaticians to analyse and visualize their DNA metabarcoding data quickly and reproducible via a graphical user interface.
@@ -10,7 +8,7 @@ TaxonTableTools is an evolving software and there will be bugs and issues at few
 
 ## Version 2
 
-TaxonTableTools2 has transitioned from PySimpleGUI to Streamlit for its graphical user interface! This shift required a complete rewrite of TTT from the ground up, so the current version may be significantly buggier than previous releases. More stable versions are planned for release throughout 2025.
+TaxonTableTools2 has transitioned from PySimpleGUI to Streamlit for its graphical user interface! This shift required a complete rewrite of TTT from the ground up, so the current version may be significantly buggier than previous releases. More stable versions are planned for release throughout 2026.
 
 ## Requirements
 
@@ -26,17 +24,9 @@ TaxonTableTools2 has transitioned from PySimpleGUI to Streamlit for its graphica
 
 3. Download the respective environment installation file for [Windows](https://github.com/TillMacher/TaxonTableTools2/blob/main/environments/taxontabletools2_env_windows_aarch64.yml) or [MacOS](https://github.com/TillMacher/TaxonTableTools2/blob/main/environments/taxontabletools2_env_macos_aarch64.yml).
 
-4. Install the metabarcoding environment by typing:
+4. Install the TTT environment by typing:
    ```sh
-   conda env create -f /Users/tillmacher/Downloads/taxontabletools2_env_windows_aarch64.yml
-   
-5. This should automatically install all dependencies. After the installation, activate the environment:
-   ```sh
-   conda activate TTT
-
-6. To update TaxonTableTools2 type:
-      ```sh
-   pip install --upgrade taxontabletools2
+   conda env create -f taxontabletools2_env_windows_aarch64.yml
 
 ## Tutorial
 
