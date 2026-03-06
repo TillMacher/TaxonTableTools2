@@ -10,10 +10,12 @@ import plotly.colors as pc
 import streamlit as st
 import pandas as pd
 import os
+import math
 import sys
 import subprocess
 import webbrowser
 import glob
+import requests, json
 from pathlib import Path
 import plotly.express as px
 from matplotlib import pyplot as plt
@@ -22,7 +24,23 @@ from matplotlib_venn import venn2_unweighted
 from matplotlib_venn import venn3
 from matplotlib_venn import venn3_unweighted
 from scipy.spatial import distance
+from scipy.spatial import ConvexHull
 import platform
+from skbio.stats.ordination import pcoa
+from sklearn.manifold import MDS
+from skbio import DistanceMatrix
+from skbio.stats.distance import anosim
+from pycirclize import Circos
+import plotly.io as pio
+import plotly.graph_objects as go
+from update_checker import UpdateChecker
+import importlib.metadata
+import statsmodels.api as sm
+from scipy import stats
+from skbio.diversity.alpha import heip_e
+from skbio.diversity.alpha import pielou_e
+from skbio.diversity.alpha import shannon
+from stqdm import stqdm
 
 ########################################################################################################################
 ## session state cheat sheet
@@ -52,20 +70,33 @@ import platform
 # TTT_colorscale
 
 if 'test' == 'pass':
-    table_display_name = Path('/Volumes/Coruscant/test_folder/TTT_projects/eDNA_physalia_2026/TaXon_tables/eDNA_physalia_2026_taxon_table_merged_NCsub_fish.xlsx')
+    table_display_name = Path('/Users/tillmacher/Desktop/TTT_projects/AA_test/TaXon_tables/eDNA_physalia_2026_taxon_table.xlsx')
     df_taxon_table = pd.read_excel(table_display_name).fillna('')
     seq_loc = df_taxon_table.columns.tolist().index('Seq')
     hash_loc = df_taxon_table.columns.tolist().index('Hash')
     species_loc = df_taxon_table.columns.tolist().index('Species')
     df_taxon_cols = df_taxon_table.columns.tolist()[hash_loc+1:species_loc+1]
-    df_samples = df_taxon_table.columns.tolist()[seq_loc+1:]
     trait_cols = ['Hash'] + df_taxon_table.columns.tolist()[species_loc+1:seq_loc]
     df_traits_table = df_taxon_table[trait_cols]
     taxon = df_taxon_table[df_taxon_cols]
     taxon_string = (df_taxon_table[df_taxon_cols].astype(str).agg(";".join, axis=1))
     similarity_loc = df_taxon_table.columns.get_loc("Similarity") + 1
     df_metadata_table = pd.read_excel(table_display_name, sheet_name='Metadata Table').fillna('')
-    selected_metadata = 'Location2'
+    df_samples = df_metadata_table['Samples'].values.tolist()
+    selected_metadata = 'Season'
+
+def default_data_handling(): # just for copying
+    # Handle Metadata
+    if fig_level != 'Samples':
+        df_taxon_table, df_samples = concatenate_by_metadata(fig_level)
+
+    if fig_taxon != 'Hash':
+        df_taxon_table_simple = simple_taxon_table(df_taxon_table)
+    else:
+        df_taxon_table_simple = df_taxon_table.copy()
+
+    if fig_nan == 'Exclude':
+        df_taxon_table_simple = df_taxon_table_simple[df_taxon_table_simple[fig_taxon] != '']
 
 ########################################################################################################################
 # Page Setup
@@ -76,57 +107,95 @@ st.set_page_config(
 )
 
 ########################################################################################################################
+## TTT template
+
+TaxonTableTools = go.layout.Template(pio.templates["simple_white"])
+
+# enable grid lines everywhere
+TaxonTableTools.layout.xaxis.update(
+    showgrid=True,
+    gridcolor="lightgrey",
+    gridwidth=1
+)
+
+TaxonTableTools.layout.yaxis.update(
+    showgrid=True,
+    gridcolor="lightgrey",
+    gridwidth=1
+)
+
+# also apply to subplot axes automatically
+TaxonTableTools.layout.update(
+    xaxis2=dict(showgrid=True, gridcolor="lightgrey"),
+    yaxis2=dict(showgrid=True, gridcolor="lightgrey")
+)
+
+# register template
+pio.templates["TaxonTableTools"] = TaxonTableTools
+
+########################################################################################################################
+# help text
+help_alphadiv = """
+                ### Evenness
+                **Evenness** describes how evenly reads (or individuals) are distributed among taxa in a sample.
+                
+                **High evenness (≈1)**  
+                - Taxa have similar abundances  
+                - The community is balanced
+                
+                **Low evenness (≈0)**  
+                - A few taxa dominate  
+                - Many taxa occur at low abundance
+                
+                **Interpretation guide**
+                - **≈1.0** → very even community  
+                - **0.5–0.8** → moderately even  
+                - **<0.5** → strong dominance by few taxa  
+                
+                Evenness measures the **distribution of abundances**, **not the number of taxa**.
+                
+                ---
+                
+                ### Shannon Index
+                The **Shannon Index** combines **richness (number of taxa)** and **evenness (distribution of abundances)** into a single diversity measure.
+                
+                **Higher values**
+                - Many taxa present
+                - Abundances are relatively even
+                
+                **Lower values**
+                - Few taxa present **or**
+                - Strong dominance by a few taxa
+                
+                **Interpretation tips**
+                - Shannon values increase with both **more taxa** and **more even communities**
+                - Communities with the same richness can have different Shannon values if their **evenness differs**
+                """
+
+########################################################################################################################
 # general functions
 
-def check_dependencies(tools=["cutadapt", "vsearch", "swarm", "blastn"]):
-    missing = []
-    for tool in tools:
-        if shutil.which(tool) is None:
-            missing.append(tool)
-    if missing:
-        missing_tools = ', '.join(missing)
-        if len(missing) == 1:
-            st.error(f'WARNING: The following tool is missing: **{missing_tools}**')
-        else:
-            st.error(f'WARNING: The following tools are missing: **{missing_tools}**')
-        st.warning('⚠️ Please install all required tools, either manually or using the "apscale_installer".')
+# taxon level plurals
+tax_level_plurals = {'Kingdom':'Kingdoms', 'Phylum':'Phyla', 'Class':'Classes', 'Order':'Orders', 'Family':'Families',
+                     'Genus':'Genera', 'Species':'Species', 'Hash':'Hashes'}
+st.session_state['tax_level_plurals'] = tax_level_plurals
+showlabels_options = ['Hide', 'top left', 'top center', 'top right', 'middle left', 'middle center', 'middle right', 'bottom left', 'bottom center', 'bottom right']
 
-def check_package_update(package_name):
-    # Get the currently installed version
-    try:
-        installed_version = importlib.metadata.version(package_name)
-    except importlib.metadata.PackageNotFoundError:
-        print(f"{package_name} is not installed.")
-        return
-
-    # Check for updates
-    res = update_check(package_name, installed_version)
-    return res
-
-def get_package_versions():
-    packages = ["apscale", "apscale_gui", "apscale_blast", "boldigger3", "cutadapt"]
-
+def check_package_update(packages):
     for pkg in packages:
-        try:
-            version = importlib.metadata.version(pkg)
-            st.write(f"{pkg}: {version}")
-        except importlib.metadata.PackageNotFoundError:
-            st.write(f"{pkg}: not installed")
+        installed_version = importlib.metadata.version(pkg)
+        checker = UpdateChecker()
+        result = checker.check(pkg, installed_version)
+        if result:
+            st.sidebar.info(result)
+            st.sidebar.info(f'$ pip install --upgrade {pkg}')
 
-    for tool in ['vsearch', 'swarm']:
-        try:
-            result = subprocess.run([tool, "--version"], capture_output=True, text=True, check=True)
-            version = result.stderr.strip().split('\n')[0]
-            st.write(f"{tool}: {version}")
-        except:
-            st.write(f"{tool}: not installed")
-
+def get_package_versions(pkg):
     try:
-        result = subprocess.run(["blastn", "-version"], capture_output=True, text=True, check=True)
-        version = result.stdout.strip().split('\n')[0]
-        st.write(version)
-    except:
-        st.write(f"blastn: not installed")
+        version = importlib.metadata.version(pkg)
+        return version
+    except importlib.metadata.PackageNotFoundError:
+        return
 
 def open_folder(folder_path):
     # Get the current operating system
@@ -185,38 +254,41 @@ def export_taxon_table(table_display_name, df_taxon_table, df_metadata_table, su
 def export_plot(folder_name, suffix, fig, lib):
 
     table_display_name = st.session_state['table_display_name']
-    table_name = table_display_name.stem
     active_project_path = st.session_state['active_project_path']
     os.makedirs(active_project_path / folder_name, exist_ok=True)
 
     if lib == 'matplot':
-        file_pdf = active_project_path / folder_name / f'{table_name}_{suffix}.pdf'
+        file_pdf = active_project_path / folder_name / f'{suffix}.pdf'
         fig.savefig(file_pdf, dpi=300, bbox_inches="tight")
         st.success(f'Saved plot as pdf!')
 
     if lib == 'plotly':
-        file_pdf = active_project_path / folder_name / f'{table_name}_{suffix}.pdf'
-        file_html = active_project_path / folder_name / f'{table_name}_{suffix}.html'
+        file_pdf = active_project_path / folder_name / f'{suffix}.pdf'
+        file_html = active_project_path / folder_name / f'{suffix}.html'
         fig.update_layout(height=st.session_state['TTT_height'], width=st.session_state['TTT_width'])
         fig.write_image(file_pdf)
         fig.write_html(file_html)
         st.success(f'Saved plot as pdf and html!')
 
-def export_table(folder_name, suffix, df, format):
+def export_table(folder_name, suffix, df, format, index=False):
     table_display_name = st.session_state['table_display_name']
-    table_name = table_display_name.stem
     active_project_path = st.session_state['active_project_path']
     os.makedirs(active_project_path / folder_name, exist_ok=True)
 
     if format == 'xlsx':
-        file_xlsx = active_project_path / folder_name / f'{table_name}_{suffix}.xlsx'
-        df.to_excel(file_xlsx)
-        st.success(f'Saved results as .xlsx!')
+        file_xlsx = active_project_path / folder_name / f'{suffix}.xlsx'
+        df.to_excel(file_xlsx, index=index)
+        return file_xlsx
+
+    if format == 'csv':
+        file_csv = active_project_path / folder_name / f'{suffix}.csv'
+        df.to_csv(file_csv, index=index)
+        return file_csv
 
     if format == 'parquet':
-        file_parquet = active_project_path / folder_name / f'{table_name}_{suffix}.parquet.snappy'
+        file_parquet = active_project_path / folder_name / f'{suffix}.parquet.snappy'
         df.to_parquet(file_parquet)
-        st.success(f'Saved results as .parquet.snappy!')
+        return file_parquet
 
 def rel_taxon_table(df_taxon_table):
     seq_loc = df_taxon_table.columns.tolist().index('Seq')
@@ -282,6 +354,15 @@ def get_colors_from_scale(scale_name, n):
     positions = [i / (n - 1) for i in range(n)]
     return pc.sample_colorscale(scale_name, positions)
 
+def get_colors_from_sequence(sequence_name, n):
+    available_colorsequences = st.session_state['available_colorsequences']
+    color_sequence = available_colorsequences[sequence_name]
+
+    # repeat the sequence enough times to cover all n
+    repeats = (n // len(color_sequence)) + 1
+    full_list = color_sequence * repeats
+    return full_list[:n]
+
 def concatenate_by_metadata(selected_metadata):
 
     df_taxon_table = st.session_state['df_taxon_table'].copy()
@@ -318,6 +399,22 @@ def concatenate_by_metadata(selected_metadata):
 
     return merged_df, updated_samples
 
+def convert_r_p(r, p):
+    r = round(r, 3)
+    if p >= 0.05:
+        p = round(p, 3)
+    elif p < 0.05 and p >= 0.001:
+        p = round(p, 3)
+    elif p < 0.001:
+        p = format(p, ".1e")
+    return r, p
+
+########################################################################################################################
+# Title
+TTT_version = get_package_versions("taxontabletools2")
+st.sidebar.markdown(f"# TaxonTableTools v{TTT_version}")
+check_package_update(["taxontabletools2"])
+
 ########################################################################################################################
 # Create Taxon Table
 def create_taxon_table():
@@ -345,7 +442,7 @@ def create_taxon_table():
 
     # taxonomy table
     if st.session_state['taxonomy_table_import_format'] == 'APSCALE':
-        expected_columns = ["unique ID", "Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species", "Similarity", "E-value", "Flag", "Ambiguous taxa", "Status"]
+        expected_columns = ["unique ID", "Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species", "Similarity", "Evalue", "Flag", "Ambiguous taxa", "Status"]
 
         for col in expected_columns:
             if col not in taxonomy_table_df.columns:
@@ -359,6 +456,10 @@ def create_taxon_table():
             st.error(f'The hashes between the tables do not match!')
             return
 
+        #  Reorder sequence col
+        col = read_table_df.pop("sequence")
+        read_table_df.insert(1, "sequence", col)
+
         # Create "Taxon Table" sheet
         merged_df = (taxonomy_table_df.merge(
             read_table_df,
@@ -370,9 +471,10 @@ def create_taxon_table():
         merged_df.rename(columns={"evalue": "Evalue"}, inplace=True)
 
         # Create "Metadata Table" sheet
-        samples = merged_df.columns.tolist()[merged_df.columns.tolist().index('Seq') + 1:]
+        seq_loc = merged_df.columns.tolist().index('Seq') + 1
+        samples = merged_df.columns.tolist()[seq_loc:]
         metadata_df = pd.DataFrame([[i] + i.split('_') for i in samples])
-        metadata_df.rename(columns={0: "Sample"}, inplace=True)
+        metadata_df.rename(columns={0: "Samples"}, inplace=True)
 
         # Save table to a single Excel file
         to_excel_path = st.session_state['active_project_path'] / 'TaXon_tables' / str(
@@ -421,7 +523,7 @@ def create_taxon_table():
         # Create "Metadata Table" sheet
         samples = merged_df.columns.tolist()[merged_df.columns.tolist().index('Seq') + 1:]
         metadata_df = pd.DataFrame([[i] + i.split('_') for i in samples])
-        metadata_df.rename(columns={0: "Sample"}, inplace=True)
+        metadata_df.rename(columns={0: "Samples"}, inplace=True)
 
         # Save table to a single Excel file
         to_excel_path = st.session_state['active_project_path'] / 'TaXon_tables' / str(
@@ -432,18 +534,128 @@ def create_taxon_table():
         st.success(f'Saved Taxon Table as: {to_excel_path}')
 
 ########################################################################################################################
+# Tutorial
+
+def TTTutorial():
+
+    st.markdown(
+        """
+        This short tutorial will guide you through your first steps in **TaxonTableTools2**.
+        Follow the steps below to set up and analyze your first project.
+        """
+    )
+
+    st.markdown("### 1️⃣ Create or Select a Project")
+
+    st.markdown(
+        """
+        - Enter the path to your **APSCALE projects directory**.
+        - TTT2 will automatically create a folder called **`TTT_projects`**.
+        - Select your newly created project from the dropdown menu.
+        - Click **"Open Active Project"** to access the project folder.
+
+        Each project contains two subfolders:
+        - 📂 `Import`
+        - 📂 `TaXon_tables`
+        """
+    )
+
+    st.markdown("### 2️⃣ Import Your Data")
+
+    st.markdown(
+        """
+        Copy your:
+        - **Read Table**
+        - **Taxonomy Table**
+
+        into the `Import` folder.
+
+        Supported formats:
+        - `.xlsx`
+        - `.parquet.snappy`
+        """
+    )
+
+    path_to_ttt = Path(__file__).resolve().parent
+    read_table_df = pd.read_excel(path_to_ttt / 'read_table_example.xlsx').fillna('')
+    taxonomy_table_df = pd.read_excel(path_to_ttt / 'taxonomy_table_example.xlsx').fillna('').round(5)
+
+    with st.expander("Example: Read Table"):
+        st.dataframe(read_table_df)
+
+    with st.expander("Example: Taxonomy Table"):
+        st.dataframe(taxonomy_table_df)
+
+    st.markdown("### 3️⃣ Create a Taxon Table")
+
+    st.markdown(
+        """
+        Go to **"Create Taxon Table"**:
+        - Select your Read Table
+        - Select your Taxonomy Table
+        - Choose the correct file formats
+
+        TTT2 will automatically merge them into a new **Taxon Table**.
+
+        All Taxon Tables are stored in:
+        📂 `TaXon_tables`
+        """
+    )
+
+    st.markdown("### 4️⃣ Load and Process Tables")
+
+    st.markdown(
+        """
+        - Load tables using the **"Load Table"** button.
+        - If your table does not appear, click **"Refresh"**.
+
+        In the **"Table Processing"** section, you can perform:
+        - Replicate merging
+        - Negative control subtraction
+        - Additional preprocessing steps
+
+        Each processing step creates a new Taxon Table version.
+        Remember to refresh and reload before continuing.
+        """
+    )
+
+    st.markdown("### 5️⃣ Create and Export Plots")
+
+    st.markdown(
+        """
+        - All visualization modules automatically save plots:
+            - as `.pdf`
+            - as interactive `.html`
+
+        - The data underlying each plot is also exported as a separate table.
+        - Plot appearance (fonts, colors, layout) can be customized via the sidebar.
+        """
+    )
+
+    st.info(
+        "⚠️ TaxonTableTools2 is still under active development. "
+        "Please verify your results carefully and report any unexpected behaviour or bugs."
+    )
+
+########################################################################################################################
 # Basic Stats
 
 def basic_stats_reads():
 
     """ Calculate the number of reads per sample """
     samples = st.session_state['df_samples']
-    df_taxon_table = st.session_state['df_taxon_table']
+    df_taxon_table = st.session_state['df_taxon_table'].copy()
     y_values = {i:sum([j for j in df_taxon_table[i].values.tolist() if j != 0]) for i in samples}
     y_values = dict(sorted(y_values.items(), reverse=True, key=lambda item: item[1]))
     x_values = list(y_values.keys())
 
-    max_reads, min_reads, avg_reads, stdev = max(y_values.values()), min(y_values.values()), round(statistics.mean(y_values.values()), 2), round(statistics.stdev(y_values.values()), 2)
+    max_reads = max(y_values.values())
+    min_reads = min(y_values.values())
+    avg_reads = round(statistics.mean(y_values.values()), 2)
+    try:
+        stdev = round(statistics.stdev(y_values.values()), 2)
+    except:
+        stdev = 0
 
     fig = go.Figure()
     fig = fig.add_trace(go.Bar(marker_color=st.session_state['TTT_color1'], x=x_values,y=list(y_values.values())))
@@ -451,7 +663,7 @@ def basic_stats_reads():
     fig.update_xaxes(title='Samples', title_font=dict(size=st.session_state['TTT_fontsize']), showticklabels=False, tickfont=dict(size=st.session_state['TTT_fontsize']))
     fig.update_layout(template=st.session_state['TTT_template'], font_size=st.session_state['TTT_fontsize'], title='Distribution of Reads')
 
-    st.plotly_chart(fig, width='stretch', height='stretch')
+    st.plotly_chart(fig, config=st.session_state['TTT_config'])
     st.write(
         f"Max: {max_reads:,.0f} | "
         f"Min: {min_reads:,.0f} | "
@@ -476,7 +688,7 @@ def basic_stats_OTUs():
     fig.update_yaxes(title = st.session_state['TTT_hash'], title_font=dict(size=st.session_state['TTT_fontsize']), tickfont=dict(size=st.session_state['TTT_fontsize']))
     fig.update_xaxes(title='Samples', title_font=dict(size=st.session_state['TTT_fontsize']), showticklabels=False, tickfont=dict(size=st.session_state['TTT_fontsize']))
 
-    st.plotly_chart(fig, width='stretch')
+    st.plotly_chart(fig, config=st.session_state['TTT_config'])
     st.write(
         f"Max: {max_OTUs:,.0f} | "
         f"Min: {min_OTUs:,.0f} | "
@@ -496,20 +708,104 @@ def top_n_taxa_plot(n=15):
     species_occurrence_dict = dict(sorted(species_occurrence_dict.items(), key=lambda item: item[1], reverse=True))
 
     # Plotly bar chart
+    x_values = [f'<i>{i}<i>' for i in list(species_occurrence_dict.keys())[:n]]
     fig = go.Figure()
     fig.add_trace(go.Bar(
-        x=[f'<i>{i}<i>' for i in list(species_occurrence_dict.keys())[:n]],  # Taxon names on x-axis
+        x=x_values,  # Taxon names on x-axis
         y=list(species_occurrence_dict.values())[:n],
-        marker_color=st.session_state['TTT_color1']
+        marker_color=st.session_state['TTT_color1'],
+        text=x_values,
+        textangle=-90
     ))
 
     fig.update_layout(template=st.session_state['TTT_template'], font_size=st.session_state['TTT_fontsize'], title=f'Top {n} Species')
     fig.update_yaxes(title = 'Occurrence', title_font=dict(size=st.session_state['TTT_fontsize']), tickfont=dict(size=st.session_state['TTT_fontsize']))
-    fig.update_xaxes(title_font=dict(size=st.session_state['TTT_fontsize']), tickangle=-45, tickfont=dict(size=st.session_state['TTT_fontsize']*0.6))
+    fig.update_xaxes(title_font=dict(size=st.session_state['TTT_fontsize']), showticklabels=False, title='Species', tickfont=dict(size=st.session_state['TTT_fontsize']*0.6))
 
-    st.plotly_chart(fig, width='stretch', height='stretch')
+    st.plotly_chart(fig, config=st.session_state['TTT_config'])
 
     st.write(f'{len(all_species)} species across {len(samples)} samples')
+
+def tax_res_plot():
+    df_taxon_table = st.session_state['df_taxon_table'].copy()
+    taxa_cols = st.session_state['taxa_cols']
+    color = st.session_state['TTT_color1']
+
+    y_values = []
+    for taxon in taxa_cols:
+        n_taxa = len([i for i in df_taxon_table[taxon].unique() if i != ''])
+        y_values.append(n_taxa)
+
+    fig = go.Figure()
+    fig = fig.add_trace(go.Bar(x=taxa_cols, y=y_values, text=y_values, textposition='outside', cliponaxis=False, marker=dict(color=color)))
+    fig.update_layout(template=st.session_state['TTT_template'], font_size=st.session_state['TTT_fontsize'], title=f'Taxonomic resolution')
+    fig.update_yaxes(title = "Taxa", title_font=dict(size=st.session_state['TTT_fontsize']), tickfont=dict(size=st.session_state['TTT_fontsize']))
+    fig.update_xaxes(title_font=dict(size=st.session_state['TTT_fontsize']), tickfont=dict(size=st.session_state['TTT_fontsize']))
+
+    st.plotly_chart(fig, config=st.session_state['TTT_config'])
+    st.write(f'{sum(y_values):,.0f} total taxa')
+
+def collect_sample_stats():
+    df_taxon_table = st.session_state['df_taxon_table'].copy()
+    df_samples = st.session_state['df_samples']
+
+    ## information about the table
+    n_OTUs = len(df_taxon_table['Hash'])
+    n_kingdoms = len(set([i for i in df_taxon_table['Kingdom'].values.tolist() if i != '']))
+    n_phyla = len(set([i for i in df_taxon_table['Phylum'].values.tolist() if i != '']))
+    n_classes = len(set([i for i in df_taxon_table['Class'].values.tolist() if i != '']))
+    n_orders = len(set([i for i in df_taxon_table['Order'].values.tolist() if i != '']))
+    n_families = len(set([i for i in df_taxon_table['Family'].values.tolist() if i != '']))
+    n_genera = len(set([i for i in df_taxon_table['Genus'].values.tolist() if i != '']))
+    n_species = len(set([i for i in df_taxon_table['Species'].values.tolist() if i != '']))
+    n_reads = df_taxon_table[df_samples].sum().sum()
+    first_row = [n_OTUs, n_kingdoms, n_phyla, n_classes, n_orders, n_families, n_genera, n_species, n_reads]
+
+    samples_info_list = []
+    for sample in df_samples:
+        sub_df = df_taxon_table[[sample, 'Hash', 'Kingdom', 'Phylum', 'Class', 'Order', 'Family', 'Genus', 'Species']]
+        sub_df = sub_df[sub_df[sample] != 0]
+
+        n_OTUs = len(sub_df['Hash'])
+        n_kingdoms = len(set([i for i in sub_df['Kingdom'].values.tolist() if i != '']))
+        n_phyla = len(set([i for i in sub_df['Phylum'].values.tolist() if i != '']))
+        n_classes = len(set([i for i in sub_df['Class'].values.tolist() if i != '']))
+        n_orders = len(set([i for i in sub_df['Order'].values.tolist() if i != '']))
+        n_families = len(set([i for i in sub_df['Family'].values.tolist() if i != '']))
+        n_genera = len(set([i for i in sub_df['Genus'].values.tolist() if i != '']))
+        n_species = len(set([i for i in sub_df['Species'].values.tolist() if i != '']))
+        n_reads = sum(sub_df[sample])
+        samples_info_list.append([sample, n_OTUs, n_kingdoms, n_phyla, n_classes, n_orders, n_families, n_genera, n_species, n_reads])
+
+    sample_stats_df = pd.DataFrame(samples_info_list,
+                                   columns=['Samples', 'Hash', 'Kingdoms', 'Phyla', 'Classes', 'Orders', 'Families', 'Genera', 'Species', 'Reads'])
+
+    # Calculate the mean for each numeric column
+    averages = sample_stats_df.select_dtypes(include=[np.number]).mean()
+    # Append the averages to the DataFrame using pandas.concat
+    sample_stats_df = pd.concat([pd.DataFrame(averages).T, sample_stats_df], ignore_index=True)
+    # Set the 'Samples' column of the first row to 'Average'
+    sample_stats_df.loc[0, 'Samples'] = 'Average'
+    # Replace the index with the 'Samples' column
+    sample_stats_df.set_index('Samples', inplace=True)
+
+    # Function to format numbers
+    def format_numbers(row):
+        if row.name == 'Average':
+            return row.round(2).astype(str)
+        else:
+            return row.astype(int).astype(str)
+
+    # Apply the function to each row
+    sample_stats_df = sample_stats_df.apply(format_numbers, axis=1)
+
+    # Insert Dataset information
+    sample_stats_df = pd.concat(
+        [pd.DataFrame([first_row], columns=sample_stats_df.columns), sample_stats_df],
+        ignore_index=False)
+    sample_stats_df.index.values[0] = "Dataset"
+
+    st.dataframe(sample_stats_df)
 
 ########################################################################################################################
 # Table Processing
@@ -525,47 +821,82 @@ def replicate_merging():
     df_taxon_table = st.session_state['df_taxon_table'].copy()
 
     cutoff_value = st.session_state['cutoff_value']
-    missing_replicates_handling = st.session_state['missing_replicates_handling']
+    missing_mode = st.session_state['missing_replicates_handling']
     suffixes = st.session_state['suffixes']
-    samples = st.session_state['df_samples']
+    df_samples = st.session_state['df_samples']
 
-    # --- derive clean sample names ---
-    clean_samples = sorted({sample.rsplit('_', 1)[0] for sample in samples})
+    # --- derive unique clean sample names ---
+    clean_samples = sorted({s.rsplit('_', 1)[0] for s in df_samples})
 
-    columns_to_drop = []
+    # Expected replicate structure
+    expected = {
+        s: [f"{s}_{suffix}" for suffix in suffixes]
+        for s in clean_samples
+    }
 
-    # --- merge replicates ---
-    for sample in clean_samples:
-        replicates = [f"{sample}_{suffix}" for suffix in suffixes]
-        existing_replicates = [r for r in replicates if r in samples]
-        # Case 1: all replicates present
-        if len(existing_replicates) == len(suffixes):
-            sub_df = df_taxon_table[existing_replicates]
-            df_taxon_table[sample] = sub_df.apply(sum_if_less_than_X_zeros, axis=1, args=(cutoff_value,))
-            columns_to_drop.extend(existing_replicates)
-        # Case 2: missing replicates
-        else:
-            if missing_replicates_handling == "Keep":
-                # do nothing → keep original replicate columns
-                continue
-            elif missing_replicates_handling == "Discard":
-                columns_to_drop.extend(existing_replicates)
+    # --- detect incomplete replicate groups ---
+    incomplete = {
+        s: reps for s, reps in expected.items()
+        if not all(r in df_taxon_table.columns for r in reps)
+    }
 
-    # Drop replicate columns after loop
-    df_taxon_table.drop(columns=columns_to_drop, inplace=True, errors="ignore")
+    if incomplete:
+        st.warning(f"{len(incomplete)} sample(s) have missing replicates.")
 
-    # Create new metadata df
-    df_metadata_table = pd.DataFrame([[i, ''] for i in samples], columns=['Samples', 'Placeholder'])
+        if missing_mode == "Remove":
+            cols_to_remove = [
+                r for reps in incomplete.values()
+                for r in reps if r in df_taxon_table.columns
+            ]
+            df_taxon_table.drop(columns=cols_to_remove, inplace=True)
 
-    suffix = "merged"
+    # --- merge complete replicate groups ---
+    replicate_cols_to_drop = []
+
+    for s, reps in expected.items():
+
+        # Skip incomplete if we keep them
+        if s in incomplete and missing_mode != "Remove":
+            continue
+
+        existing_reps = [r for r in reps if r in df_taxon_table.columns]
+        if not existing_reps:
+            continue
+
+        sub_df = df_taxon_table[existing_reps]
+
+        df_taxon_table[s] = sub_df.apply(
+            sum_if_less_than_X_zeros,
+            axis=1,
+            args=(cutoff_value,)
+        )
+
+        replicate_cols_to_drop.extend(existing_reps)
+
+    # Drop replicate columns
+    if replicate_cols_to_drop:
+        df_taxon_table.drop(columns=replicate_cols_to_drop, inplace=True)
+
+    # --- rebuild metadata based on actual remaining columns ---
+    seq_loc = df_taxon_table.columns.get_loc('Seq')
+    final_samples = df_taxon_table.columns[seq_loc + 1:]
+
+    df_metadata_table = pd.DataFrame({
+        "Samples": final_samples,
+        "Placeholder": ""
+    })
+
+    # --- export ---
     export_taxon_table(
         table_display_name,
         df_taxon_table,
         df_metadata_table,
-        suffix
+        "merged"
     )
 
-    st.success(f'Replicates were merged and a new table was saved to "{str(table_display_name.name).replace(".xlsx", "_merged.xlsx")}"')
+    st.success(
+        f'Replicates merged → "{table_display_name.name.replace(".xlsx", "_merged.xlsx")}"'
+    )
 
 def NC_subtraction():
     table_display_name = st.session_state['table_display_name']
@@ -669,19 +1000,14 @@ def read_based_normalisation():
         total_reads = read_df[sample].sum()
 
         if sub_sample_size <= total_reads:
-
             # Expand reads into list for subsampling
             read_list = pd.Series(np.repeat(read_df["Hash"].to_list(), read_df[sample].to_list()))
-
             # Random subsample
             sub_sample = read_list.sample(n=sub_sample_size)
-
             # Count reads per OTU
             sub_sample_reads = sub_sample.value_counts().to_dict()
-
             # Reconstruct OTU column in correct order
             df[sample] = [sub_sample_reads.get(otu, 0) for otu in hash_list]
-
         else:
             # Keep original reads if too few
             df[sample] = df[sample]
@@ -810,6 +1136,171 @@ def trait_filter():
 
 ########################################################################################################################
 # Table conversion
+
+def merge_taxon_tables():
+
+    # General
+    TTT_hash = st.session_state['TTT_hash']
+
+    # Load second table
+    df2_taxon_table_file = st.session_state['df2_taxon_table_file']
+
+    if str(df2_taxon_table_file) == 'None':
+        return
+    elif str(df2_taxon_table_file.name).endswith('.xlsx'):
+        df2_taxon_table = pd.read_excel(df2_taxon_table_file).fillna('')
+        df2_metadata_table = pd.read_excel(df2_taxon_table_file, sheet_name='Metadata Table').fillna('')
+    else:
+        st.warning('Please provide a table in .xlsx format!')
+        return
+
+    # Load first table
+    df1_taxon_table = st.session_state['df_taxon_table']
+    df1_metadata_table = st.session_state['df_metadata_table']
+    df1_samples = st.session_state['df_samples']
+    table_display_name = st.session_state['table_display_name']
+    table_merge_suffix = st.session_state['table_merge_suffix']
+
+    # Identify column structure
+    species_loc1 = df1_taxon_table.columns.get_loc('Species')
+    seq_loc1 = df1_taxon_table.columns.get_loc('Seq')
+    trait_cols1 = list(df1_taxon_table.columns[species_loc1+2:seq_loc1])
+    df1_traits = df1_taxon_table[['Hash'] + trait_cols1]
+    df1_taxon_table = df1_taxon_table.drop(columns=trait_cols1)
+
+    species_loc2 = df2_taxon_table.columns.get_loc('Species')
+    seq_loc2 = df2_taxon_table.columns.get_loc('Seq')
+    trait_cols2 = list(df2_taxon_table.columns[species_loc2+2:seq_loc2])
+    df2_samples = df2_taxon_table.columns[seq_loc2+1:]
+    df2_traits = df2_taxon_table[['Hash'] + trait_cols2]
+    df2_taxon_table = df2_taxon_table.drop(columns=trait_cols2)
+
+    ## calculate shared traits
+    shared_traits = list(set(trait_cols1) & set(trait_cols2))
+
+    if len(set(df1_samples) & set(df2_samples)) != 0:
+        st.error('Error: Cannot merge tables with overlapping sample names!')
+    else:
+        ## Collect some stats
+        ESVs_1 = set(df1_taxon_table['Hash'].values.tolist())
+        ESVs_2 = set(df2_taxon_table['Hash'].values.tolist())
+        a_only = len(ESVs_1 - ESVs_2)
+        shared = len(ESVs_1 & ESVs_2)
+        b_only = len(ESVs_2 - ESVs_1)
+        total = a_only + shared + b_only
+        all_hashes = sorted(set(df1_taxon_table['Hash'].values.tolist() + df2_taxon_table['Hash'].values.tolist()))
+
+        st.markdown(f"""
+        **Shared ESVs:** {shared}  
+        **Original exclusive {TTT_hash}:** {a_only}  
+        **Added exclusive {TTT_hash}:** {b_only}  
+        **Total ESVs:** {total}
+        """)
+
+        merged_taxon_table_df = pd.DataFrame()
+        for hash in stqdm(all_hashes, desc=f'Looping through {TTT_hash}'):
+            new_row = pd.DataFrame()
+
+            # Case 1: Present in both datasets: Merge them and select the taxonomy with the higher similarity
+            if hash in ESVs_1 and hash in ESVs_2:
+                # data from table 1
+                row1 = df1_taxon_table.loc[df1_taxon_table['Hash'] == hash]
+                data1 = row1.iloc[:, :10]
+                similarity1 = row1['Similarity'].values.tolist()[0]
+                reads1 = row1[df1_samples]
+                traits1 = df1_traits.loc[df1_traits['Hash'] == hash][shared_traits]
+                traits1['ESV merge'] = ['Shared']
+
+                # data from table 2
+                row2 = df2_taxon_table.loc[df2_taxon_table['Hash'] == hash]
+                data2 = row2.iloc[:, :10]
+                similarity2 = row2['Similarity'].values.tolist()[0]
+                reads2 = row2[df2_samples]
+                traits2 = df2_traits.loc[df2_traits['Hash'] == hash][shared_traits]
+
+                if data1.values.tolist() == data2.values.tolist():
+                    # Find the index of the column "Seq"
+                    col_index = data1.columns.get_loc("Seq")
+                    # Insert the new DataFrame columns before "Seq"
+                    data1_traits = pd.concat([data1.iloc[:, :col_index], traits1, data1.iloc[:, col_index:]], axis=1)
+                    new_row = pd.concat([data1_traits.reset_index(drop=True),
+                                         reads1.reset_index(drop=True),
+                                         reads2.reset_index(drop=True)], axis=1)
+
+                elif similarity1 > similarity2:
+                    # Find the index of the column "Seq"
+                    col_index = data1.columns.get_loc("Seq")
+                    # Insert the new DataFrame columns before "Seq"
+                    data1_traits = pd.concat([data1.iloc[:, :col_index], traits1, data1.iloc[:, col_index:]], axis=1)
+                    new_row = pd.concat([data1_traits.reset_index(drop=True),
+                                         reads1.reset_index(drop=True),
+                                         reads2.reset_index(drop=True)], axis=1)
+                else:
+                    # Find the index of the column "Seq"
+                    col_index = data2.columns.get_loc("Seq")
+                    # Insert the new DataFrame columns before "Seq"
+                    data2_traits = pd.concat([data2.iloc[:, :col_index], traits2, data2.iloc[:, col_index:]], axis=1)
+                    new_row = pd.concat([data2_traits.reset_index(drop=True),
+                                         reads1.reset_index(drop=True),
+                                         reads2.reset_index(drop=True)], axis=1)
+
+            # Case 2: Present in dataset 1: Fill up the other
+            elif hash in ESVs_1:
+                # data from table 1
+                row1 = df1_taxon_table.loc[df1_taxon_table['Hash'] == hash]
+                data1 = row1.iloc[:, :10]
+                reads1 = row1[df1_samples]
+                traits1 = df1_traits.loc[df1_traits['Hash'] == hash][shared_traits]
+                traits1['ESV merge'] = ['Original']
+
+                # data from table 2
+                reads2 = pd.DataFrame([[0] * len(df2_samples)], columns=df2_samples)
+
+                # Find the index of the column "Seq"
+                col_index = data1.columns.get_loc("Seq")
+                # Insert the new DataFrame columns before "Seq"
+                data1_traits = pd.concat([data1.iloc[:, :col_index], traits1, data1.iloc[:, col_index:]], axis=1)
+                new_row = pd.concat([data1_traits.reset_index(drop=True),
+                                     reads1.reset_index(drop=True),
+                                     reads2.reset_index(drop=True)], axis=1)
+
+            # Case 2: Present in dataset 1: Fill up the other
+            elif hash in ESVs_2:
+                # data from table 1
+                row2 = df2_taxon_table.loc[df2_taxon_table['Hash'] == hash]
+                data2 = row2.iloc[:, :10]
+                reads2 = row2[df2_samples]
+                traits2 = df2_traits.loc[df2_traits['Hash'] == hash][shared_traits]
+                traits2['ESV merge'] = ['Added']
+
+                # data from table 2
+                reads1 = pd.DataFrame([[0] * len(df1_samples)], columns=df1_samples)
+
+                # Find the index of the column "Seq"
+                col_index = data2.columns.get_loc("Seq")
+                # Insert the new DataFrame columns before "Seq"
+                data2_traits = pd.concat([data2.iloc[:, :col_index], traits2, data2.iloc[:, col_index:]], axis=1)
+                new_row = pd.concat([data2_traits.reset_index(drop=True),
+                                     reads1.reset_index(drop=True),
+                                     reads2.reset_index(drop=True)], axis=1)
+
+            else:
+                print('Whoops that should not happen!')
+
+            ## add to newly merged df
+            merged_taxon_table_df = pd.concat([merged_taxon_table_df, new_row], ignore_index=True)
+
+    ## the merged_df is the new Taxon Table
+    ## now create the Metadata Table
+    ## calculate shared metadata
+    shared_metadata = list(set(df1_metadata_table.columns.tolist()) & set(df2_metadata_table.columns.tolist()))
+    export_metadata_table_df = pd.concat([df1_metadata_table[shared_metadata], df2_metadata_table[shared_metadata]], ignore_index=True)
+    export_metadata_table_df['ESV merge'] = ['Original'] * len(df1_metadata_table) + ['Added'] * len(df2_metadata_table)
+
+    ## export df
+    export_taxon_table(table_display_name, merged_taxon_table_df, export_metadata_table_df, table_merge_suffix)
+
+    st.success(f'Tables were successfully merged!')
 
 def simplify_table(save=True):
 
@@ -1072,7 +1563,7 @@ def venn_diagram():
         plt.title(f"{venn_taxon_level} Overlap", fontsize=st.session_state['TTT_fontsize'])
         st.pyplot(fig)
 
-        export_plot('Venn_diagrams', f'{venn_metadata}_{venn_taxon_level}', plt, 'matplot')
+        export_plot('Venn_diagrams', f'{name}_{venn_metadata}_{venn_taxon_level}', plt, 'matplot')
 
     elif len(venn_categories) == 3:
         name_a, name_b, name_c = venn_categories
@@ -1233,18 +1724,25 @@ def readdist_diagram():
     if fig_nan == 'Exclude':
         df_taxon_table_simple = df_taxon_table_simple[df_taxon_table_simple[fig_taxon] != '']
     df_taxon_table_simple_s = (df_taxon_table_simple[[fig_taxon] + df_samples].groupby(fig_taxon, as_index=False).sum())
-    all_taxa = df_taxon_table_simple[fig_taxon].unique()
-
-    # Output Table
-    # TBD
+    all_taxa = sorted(df_taxon_table_simple[fig_taxon].unique())[::-1]
 
     # Output Plot
+    # Colors
+    if fig_color == 'Color Scale':
+        colors = get_colors_from_scale(TTT_colorscale, len(all_taxa))
+    if fig_color == 'Color Sequence':
+        colors = get_colors_from_sequence(TTT_colorsequence, len(all_taxa))
+
     fig = go.Figure()
-    colors = get_colors_from_scale(st.session_state['TTT_colorscale'], len(all_taxa))
+    res = []
     for c, taxon in enumerate(all_taxa):
         y_values = df_taxon_table_simple_s[df_taxon_table_simple_s[fig_taxon] == taxon][df_samples].values.tolist()[0]
         x_values = df_samples
         fig.add_trace(go.Bar(x=x_values, y=y_values, name=taxon, marker=dict(color=colors[c])))
+        res.append(y_values)
+    
+    df_data = pd.DataFrame(res, index=all_taxa, columns=x_values)
+    df_data_rel = df_data.div(df_data.sum(axis=0), axis=1) * 100
 
     # Specific Layout
     if fig_taxon == 'Hash':
@@ -1261,67 +1759,309 @@ def readdist_diagram():
     fig.update_layout(template=template, font_size=fontsize, showlegend=showlegend)
 
     # Plot
-    st.plotly_chart(fig, width='stretch', height='stretch')
+    st.plotly_chart(fig, config=st.session_state['TTT_config'])
 
     # Export
-    export_plot("Read_proportions_plots", f"{name}_{fig_mode}_{fig_level}_{fig_taxon}", fig, "plotly")
+    export_plot("Read_proportions", f"{name}_{fig_mode}_{fig_level}_{fig_taxon}", fig, "plotly")
+    export_table("Read_proportions", f"{name}_{fig_mode}_{fig_level}_{fig_taxon}", df_data_rel, "xlsx", True)
 
-########################################################################################################################
-# Alpha Diversity
-
-def alpha_richness_diagram():
+def read_hash_autocorrelation():
 
     # Layout
     fontsize = st.session_state['TTT_fontsize']
     template = st.session_state['TTT_template']
     showlegend = st.session_state['TTT_showlegend']
+    TTT_colorscale = st.session_state['TTT_colorscale']
+    TTT_colorsequence = st.session_state['TTT_colorsequence']
+    TTT_color1 = st.session_state['TTT_color1']
+    TTT_jitter = st.session_state['TTT_jitter']
+    TTT_linewidth = st.session_state['TTT_linewidth']
+    TTT_scattersize = st.session_state['TTT_scattersize'] * 0.5
+
+    name = st.session_state['table_display_name'].stem
+    df_taxon_table = st.session_state['df_taxon_table']
+    df_samples = st.session_state['df_samples']
+    TTT_hash = st.session_state['TTT_hash']
+
+    # Per Sample
+    x_values = []
+    y_values = []
+    for sample in df_samples:
+        sub_df = df_taxon_table[sample]
+        n_ESVs = len([i for i in sub_df.values.tolist() if i != 0])
+        n_reads = sub_df.sum()
+        x_values.append(n_reads)
+        y_values.append(n_ESVs)
+
+    fig = go.Figure()
+
+    # Data
+    fig.add_trace(go.Scatter(x=x_values, y=y_values, text=df_samples, mode='markers', cliponaxis=False, name='Samples', marker=dict(color=TTT_color1)))
+
+    # Regression line
+    slope, intercept, r_value, p_value, std_err = stats.linregress(x_values, y_values)
+    x_line = np.array(x_values)
+    y_line = intercept + slope * x_line
+    fig.add_trace(go.Scatter(
+        x=x_line,
+        y=y_line,
+        mode='lines',
+        name='Regression line',
+        line=dict(color=TTT_color2)))
+
+    # Spearman
+    rho, p = stats.spearmanr(x_values, y_values)
+    rho, p = convert_r_p(rho, p)
+    title = f'Read/{TTT_hash[:-1]} auto-correlation rho={rho} (p={p})'
+
+    # Default Layout
+    fig.update_yaxes(title_font=dict(size=fontsize), tickfont=dict(size=fontsize))
+    fig.update_xaxes(title_font=dict(size=fontsize), tickfont=dict(size=fontsize))
+    fig.update_layout(template=template, font_size=fontsize, showlegend=showlegend, title=title)
+
+    # Plot
+    st.plotly_chart(fig, config=st.session_state['TTT_config'])
+
+    # Export
+    df = pd.DataFrame([df_samples, x_values, y_values]).transpose()
+    df.columns = ['Sample', 'Reads', TTT_hash]
+    export_plot("Read_proportions", f"{name}_reads_{TTT_hash}_corr", fig, "plotly")
+    export_table("Read_proportions", f"{name}_reads_{TTT_hash}_corr", df, "xlsx", False)
+
+def read_rarefaction():
+    # Layout
+    fontsize = st.session_state['TTT_fontsize']
+    template = st.session_state['TTT_template']
+    showlegend = st.session_state['TTT_showlegend']
+    TTT_colorscale = st.session_state['TTT_colorscale']
+    TTT_colorsequence = st.session_state['TTT_colorsequence']
+    TTT_color1 = st.session_state['TTT_color1']
+    TTT_jitter = st.session_state['TTT_jitter']
+    TTT_linewidth = st.session_state['TTT_linewidth']
+    TTT_scattersize = st.session_state['TTT_scattersize'] * 0.5
+
+    name = st.session_state['table_display_name'].stem
+    df_taxon_table = st.session_state['df_taxon_table']
+    df_samples = st.session_state['df_samples']
+    fig_taxon = st.session_state['read_rarefaction_taxon']
+    read_rarefaction_splits = st.session_state['read_rarefaction_splits']
+    read_rarefaction_reps = st.session_state['read_rarefaction_reps']
+    fig_color = st.session_state['read_rarefaction_color']
+    fig_display = st.session_state['read_rarefaction_display']
+
+    if fig_taxon != 'Hash':
+        df_taxon_table_simple = simple_taxon_table(df_taxon_table)
+    else:
+        df_taxon_table_simple = df_taxon_table
+
+    # Drop NaN
+    df_taxon_table_simple = df_taxon_table_simple[df_taxon_table_simple[fig_taxon] != '']
+
+    rarefaction_res = {}
+    for sample in stqdm(df_samples, desc="Calculating Rarefaction Curves"):
+        # Collect relevant data
+        read_df = df_taxon_table_simple[[sample, fig_taxon]].copy()
+        read_df = read_df[read_df[sample] != 0]
+        max_taxa = read_df[fig_taxon].nunique()
+        total_reads = read_df[sample].sum()
+
+        # Expand reads into list for subsampling
+        read_list = pd.Series(np.repeat(read_df[fig_taxon].to_list(), read_df[sample].to_list()))
+
+        # Random Subsampling
+        x_values = []
+        y_values = []
+        stdev_values = []
+        sub_sample_size = total_reads / read_rarefaction_splits
+
+        reads_pool = 0
+        for subset in range(0, read_rarefaction_splits+1):
+            x_res = []
+            y_res = []
+            for rep in range(0, read_rarefaction_reps):
+                try:
+                    sub_sample = read_list.sample(n=math.ceil(reads_pool))
+                    n_taxa = len(set(sub_sample))
+                except:
+                    n_taxa = max_taxa
+                if fig_display == 'Relative':
+                    if max_taxa == 0:
+                        n_taxa = 0
+                    else:
+                        n_taxa = n_taxa / max_taxa * 100
+                x_res.append(math.ceil(reads_pool))
+                y_res.append(n_taxa)
+            # collect results
+            avg_taxa = np.mean(y_res)
+            stdev = np.std(y_res)
+            x_values.append(math.ceil(reads_pool))
+            y_values.append(avg_taxa)
+            stdev_values.append(stdev)
+            reads_pool += sub_sample_size
+
+        df = pd.DataFrame([x_values, y_values, stdev_values]).transpose()
+        df.columns = ['Reads', fig_taxon, 'STDEV']
+        rarefaction_res[sample] = df
+
+    # PLOT
+    # Colors
+    if fig_color == 'Color Scale':
+        colors = get_colors_from_scale(TTT_colorscale, len(df_samples))
+    if fig_color == 'Color Sequence':
+        colors = get_colors_from_sequence(TTT_colorsequence, len(df_samples))
+    if fig_color == 'Single Color':
+        colors = [TTT_color1] * len(df_samples)
+
+    fig = go.Figure()
+    c=0
+    for sample, df in rarefaction_res.items():
+        x_values = df['Reads']
+        y_values = df[fig_taxon]
+        fig.add_trace(go.Scatter(x=x_values, y=y_values, name=sample, cliponaxis=False, mode='lines', line=dict(width=TTT_linewidth), marker=dict(color=colors[c])))
+        c+=1
+
+    if fig_display == 'Relative':
+        fig.update_yaxes(range=(0,101), title=f'{fig_taxon} (%)')
+    else:
+        fig.update_yaxes(rangemode='tozero', title=fig_taxon)
+
+    # Default Layout
+    fig.update_yaxes(title_font=dict(size=fontsize), tickfont=dict(size=fontsize))
+    fig.update_xaxes(title_font=dict(size=fontsize), tickfont=dict(size=fontsize))
+    fig.update_layout(template=template, font_size=fontsize, showlegend=showlegend)
+
+    # Plot
+    st.plotly_chart(fig, config=st.session_state['TTT_config'])
+
+    # Export
+    export_plot("Read_proportions", f"{name}_{fig_taxon}_{fig_display.lower()}_read_rarefaction_curve", fig, "plotly")
+
+    # Export multiple dfs to a single file
+    try:
+        active_project_path = st.session_state['active_project_path']
+        export_file = active_project_path / "Read_proportions" / f"{name}_{fig_taxon}_{fig_display.lower()}_read_rarefaction_curve.xlsx"
+        with pd.ExcelWriter(export_file, engine="xlsxwriter") as writer:
+            i = 0
+            for sample, df in rarefaction_res.items():
+                sample_name = f"{i}_{sample[:28]}"
+                df.to_excel(writer, sheet_name=str(sample_name), index=False)
+                i += 1
+    except:
+        st.warning('Unable to write Rarefaction results to .xslx!')
+
+########################################################################################################################
+# Alpha Diversity
+
+def alphadiv_diagram():
+
+    # Layout
+    fontsize = st.session_state['TTT_fontsize']
+    template = st.session_state['TTT_template']
+    showlegend = st.session_state['TTT_showlegend']
+    TTT_colorscale = st.session_state['TTT_colorscale']
+    TTT_colorsequence = st.session_state['TTT_colorsequence']
+    TTT_color1 = st.session_state['TTT_color1']
+    TTT_jitter = st.session_state['TTT_jitter']
+    TTT_linewidth = st.session_state['TTT_linewidth']
+    TTT_scattersize = st.session_state['TTT_scattersize'] * 0.5
 
     # Tables
     name = st.session_state['table_display_name'].stem
     df_taxon_table = st.session_state['df_taxon_table'].copy()
 
-
     # Options
     df_metadata_table = st.session_state['df_metadata_table'].copy()
     df_samples = st.session_state['df_samples'].copy()
-    fig_color = st.session_state['richness_color'] # color sequence or scale
-    fig_mode = st.session_state['richness_mode'] # Bar or Box/Violin
-    fig_level = st.session_state['richness_level'] # sample or metadata
-    fig_taxon = st.session_state['richness_taxon'] # taxonomic level
-    fig_nan = st.session_state['richness_nan'] # include or exclude
-    fig_boxpoints = st.session_state['richness_boxpoints']
+    fig_color = st.session_state['alphadiv_color'] # color sequence or scale
+    fig_layout = st.session_state['alphadiv_layout'] # Bar or Box/Violin
+    fig_level = st.session_state['alphadiv_level'] # sample or metadata
+    fig_taxon = st.session_state['alphadiv_taxon'] # taxonomic level
+    fig_nan = 'Exclude'
+    fig_boxpoints = st.session_state['alphadiv_boxpoints']
+    fig_measure = st.session_state['alphadiv_measure'] # richness or diff
+    fig_mode = st.session_state['alphadiv_mode'] # quantification
+    fig_interpration_lines = st.session_state['alphadiv_interpration']
 
-    if fig_mode == 'Bar':
+    fig = go.Figure()
 
-        # Handle Metadata
-        if fig_level != 'Samples':
-            df_taxon_table, df_samples = concatenate_by_metadata(fig_level)
-        df_taxon_table_simple = simple_taxon_table(df_taxon_table)
+    # Handle Metadata
+    df_taxon_table_simple = df_taxon_table.copy()
+    if fig_nan == 'Exclude':
+        df_taxon_table_simple = df_taxon_table_simple[df_taxon_table_simple[fig_taxon] != '']
 
-        # Analysis
-        if fig_nan == 'Exclude':
-            df_taxon_table_simple = df_taxon_table_simple[df_taxon_table_simple[fig_taxon] != '']
-        df_taxon_table_simple_s = (df_taxon_table_simple[[fig_taxon] + df_samples].groupby(fig_taxon, as_index=False).sum())
-
-        # Output Table
-        # TBD
-
-        fig = go.Figure()
-        if fig_color == 'Single Color':
-            colors = [st.session_state['TTT_color1'] ] * len(df_samples)
+    # calculate y-values
+    all_taxa = sorted(df_taxon_table_simple[fig_taxon].unique())
+    res = {}
+    counts_dict = {}
+    if fig_measure == 'Richness':
+        for sample in df_samples:
+            sub_df = df_taxon_table_simple[[fig_taxon, sample]]
+            counts = sub_df[sub_df[sample] != 0][fig_taxon].nunique()
+            res[sample] = counts
+            counts = [len(sub_df[(sub_df[fig_taxon] == i) & (sub_df[sample] != 0)]) for i in all_taxa]
+            counts_dict[sample] = counts # here we must provide an alternative df
+    else:
+        if fig_mode == 'Rel. Reads':
+            for sample in df_samples:
+                sub_df = df_taxon_table_simple[[fig_taxon, sample]]
+                total_reads = sub_df[sample].sum()
+                counts = [sub_df[sub_df[fig_taxon] == i][sample].sum() / total_reads * 100 for i in all_taxa]
+                counts_dict[sample] = counts
+                if fig_measure == 'Heip Evenness':
+                    res[sample] = heip_e(counts)
+                elif fig_measure == 'Pielou Evenness':
+                    res[sample] = pielou_e(counts)
+                else:
+                    res[sample] = shannon(counts)
         else:
-            colors = get_colors_from_scale(st.session_state['TTT_colorscale'], len(df_samples))
-        for c, sample in enumerate(df_samples):
-            x_values = [sample]
-            y_values = [len([i for i,j in df_taxon_table_simple_s[[fig_taxon, sample]].values.tolist() if j != 0])]
-            fig.add_trace(go.Bar(x=x_values, y=y_values, name=sample, marker=dict(color=colors[c])))
+            # Haplotype Richness
+            for sample in df_samples:
+                sub_df = df_taxon_table_simple[[fig_taxon, sample]]
+                counts = [len(sub_df[(sub_df[fig_taxon] == i) & (sub_df[sample] != 0)]) for i in all_taxa]
+                counts_dict[sample] = counts
+                if fig_measure == 'Heip Evenness':
+                    res[sample] = heip_e(counts)
+                elif fig_measure == 'Pielou Evenness':
+                    res[sample] = pielou_e(counts)
+                else:
+                    res[sample] = shannon(counts)
+
+    df1 = pd.DataFrame(counts_dict.values(), index=counts_dict.keys(), columns=all_taxa).transpose()
+    df2 = pd.DataFrame(res.values(), index=res.keys(), columns=[fig_measure])
+
+    if fig_layout == 'Bar':
+        # Colors
+        x_values = list(res.keys())
+        if fig_color == 'Color Scale':
+            colors = get_colors_from_scale(TTT_colorscale, len(x_values))
+        if fig_color == 'Color Sequence':
+            colors = get_colors_from_sequence(TTT_colorsequence, len(x_values))
+        if fig_color == 'Single Color':
+            colors = [TTT_color1] * len(x_values)
+
+        # Traces
+        c = 0
+        for x_values, y_values in res.items():
+            fig.add_trace(go.Bar(x=[x_values], y=[y_values], name=x_values, marker=dict(color=colors[c])))
+            c += 1
 
         # Specific Layout
         if fig_taxon == 'Hash':
             fig_taxon = st.session_state['TTT_hash'][:-1]
+            fig.update_yaxes(title=f"{fig_taxon} {fig_measure}")
+        else:
+            fig.update_yaxes(title=f"{st.session_state['tax_level_plurals'][fig_taxon]} {fig_measure}")
+        if fig_measure == 'Heip Evenness' or fig_measure == 'Pielou Evenness':
+            fig.update_yaxes(range=(0,1.1))
+        else:
+            fig.update_yaxes(rangemode='tozero')
         fig.update_xaxes(dtick='linear')
-        fig.update_yaxes(title=f'{fig_taxon} Richness')
-        fig.update_layout(title=f'{fig_taxon} Richness')
+
+        # Add intrepration guidance
+        if fig_interpration_lines == "Yes" and (fig_measure == 'Heip Evenness' or fig_measure == 'Pielou Evenness'):
+            fig.add_hrect(y0=0.8, y1=1.0, fillcolor="green", opacity=0.2, layer="below", line_width=0)
+            fig.add_hrect(y0=0.5, y1=0.8, fillcolor="yellow", opacity=0.2, layer="below", line_width=0)
+            fig.add_hrect(y0=0.0, y1=0.5, fillcolor="orange", opacity=0.2, layer="below", line_width=0)
 
         # Default Layout
         fig.update_yaxes(title_font=dict(size=fontsize), tickfont=dict(size=fontsize))
@@ -1329,57 +2069,94 @@ def alpha_richness_diagram():
         fig.update_layout(template=template, font_size=fontsize, showlegend=showlegend)
 
         # Plot
-        st.plotly_chart(fig)
+        st.plotly_chart(fig, config=st.session_state['TTT_config'])
 
         # Export
-        export_plot("Alpha_diversity", f"{name}_{fig_mode}_{fig_level}_{fig_taxon}", fig, "plotly")
+        export_plot("Alpha_diversity", f"{name}_{fig_taxon}_{fig_measure}_{fig_mode}", fig, "plotly")
+        export_table("Alpha_diversity", f"{name}_{fig_taxon}_{fig_measure}_{fig_mode}_1", df1, "xlsx", True)
+        export_table("Alpha_diversity", f"{name}_{fig_taxon}_{fig_measure}_{fig_mode}_2", df2, "xlsx", True)
 
-    elif fig_mode == 'Box' or fig_mode == 'Violin':
+    elif fig_layout == 'Scatter':
+        # Colors
+        x_values = list(res.keys())
+        y_values = pd.Series(res).fillna(0).tolist()
+        fig.add_trace(go.Scatter(x=x_values, y=y_values, fill='tozeroy', name='', line=dict(width=TTT_linewidth), marker=dict(color=TTT_color1)))
+
+        # Specific Layout
+        if fig_taxon == 'Hash':
+            fig_taxon = st.session_state['TTT_hash'][:-1]
+            fig.update_yaxes(title=f"{fig_taxon} {fig_measure}")
+        else:
+            fig.update_yaxes(title=f"{st.session_state['tax_level_plurals'][fig_taxon]} {fig_measure}")
+        if fig_measure == 'Heip Evenness':
+            fig.update_yaxes(range=(0,1.1))
+        else:
+            fig.update_yaxes(rangemode='tozero')
+        fig.update_xaxes(dtick='linear')
+
+        # Add intrepration guidance
+        if fig_interpration_lines == "Yes" and (fig_measure == 'Heip Evenness' or fig_measure == 'Pielou Evenness'):
+            fig.add_hrect(y0=0.8, y1=1.0, fillcolor="green", opacity=0.2, layer="below", line_width=0)
+            fig.add_hrect(y0=0.5, y1=0.8, fillcolor="yellow", opacity=0.2, layer="below", line_width=0)
+            fig.add_hrect(y0=0.0, y1=0.5, fillcolor="orange", opacity=0.2, layer="below", line_width=0)
+
+        # Default Layout
+        fig.update_yaxes(title_font=dict(size=fontsize), tickfont=dict(size=fontsize))
+        fig.update_xaxes(title_font=dict(size=fontsize), tickfont=dict(size=fontsize))
+        fig.update_layout(template=template, font_size=fontsize, showlegend=False)
+
+        # Plot
+        st.plotly_chart(fig, config=st.session_state['TTT_config'])
+
+        # Export
+        export_plot("Alpha_diversity", f"{name}_{fig_taxon}_{fig_measure}_{fig_mode}", fig, "plotly")
+        export_table("Alpha_diversity", f"{name}_{fig_taxon}_{fig_measure}_{fig_mode}_1", df1, "xlsx", True)
+        export_table("Alpha_diversity", f"{name}_{fig_taxon}_{fig_measure}_{fig_mode}_2", df2, "xlsx", True)
+
+    elif fig_layout == 'Box' or fig_layout == 'Violin':
         if fig_level == 'Samples':
             st.error('Please select a metadata category instead of "Samples"!')
             return
 
         # Collect metadata
-        test_metadata = [i for i in list(df_metadata_table[fig_level].unique()) if i != '']
-
-        # Create simple table
-        df_taxon_table_simple = simple_taxon_table(df_taxon_table)
-
-        # Analysis
-        if fig_nan == 'Exclude':
-            df_taxon_table_simple = df_taxon_table_simple[df_taxon_table_simple[fig_taxon] != '']
-        df_taxon_table_simple_s = (df_taxon_table_simple[[fig_taxon] + df_samples].groupby(fig_taxon, as_index=False).sum())
-
-        # Output Table
-        # TBD
-
-        fig = go.Figure()
-
+        test_groups = [i for i in list(df_metadata_table[fig_level].unique()) if i != '']
+        # Colors
+        if fig_color == 'Color Scale':
+            colors = get_colors_from_scale(TTT_colorscale, len(test_groups))
+        if fig_color == 'Color Sequence':
+            colors = get_colors_from_sequence(TTT_colorsequence, len(test_groups))
         if fig_color == 'Single Color':
-            colors = [st.session_state['TTT_color1']] * len(test_metadata)
-        else:
-            colors = get_colors_from_scale(st.session_state['TTT_colorscale'], len(test_metadata))
+            colors = [TTT_color1] * len(test_groups)
 
-        for c, metadata in enumerate(test_metadata):
-            test_samples = list(df_metadata_table[df_metadata_table[fig_level] == metadata]['Samples'].unique())
-            if len(test_samples) == 1:
-                test_samples = [test_samples]
-            y_values = [(df_taxon_table_simple_s[sample] != 0).sum() for sample in test_samples]
-            if fig_mode == 'Box':
-                fig.add_trace(go.Box(y=y_values, name=metadata, marker=dict(color=colors[c])))
-            if fig_mode == 'Violin':
-                fig.add_trace(go.Violin(y=y_values, name=metadata, marker=dict(color=colors[c])))
+        c = 0
+        for test_group in test_groups:
+            group_samples = df_metadata_table[df_metadata_table[fig_level] == test_group]['Samples'].values.tolist()
+            y_values = df2[df2.index.isin(group_samples)][fig_measure].values.tolist()
+            if fig_layout == 'Box':
+                boxpoints = 'all' if fig_boxpoints == 'All' else False
+                fig.add_trace(go.Box(y=y_values, name=test_group, jitter=TTT_jitter, boxpoints=boxpoints, line=dict(width=TTT_linewidth), marker=dict(size=TTT_scattersize, color=colors[c])))
+            else:
+                boxpoints = 'all' if fig_boxpoints == 'All' else False
+                fig.add_trace(go.Violin(y=y_values, name=test_group, jitter=TTT_jitter, points=boxpoints, line=dict(width=TTT_linewidth), marker=dict(size=TTT_scattersize, color=colors[c])))
+            c += 1
 
         # Specific Layout
         if fig_taxon == 'Hash':
             fig_taxon = st.session_state['TTT_hash'][:-1]
+            fig.update_yaxes(title=f"{fig_taxon} {fig_measure}")
+        else:
+            fig.update_yaxes(title=f"{st.session_state['tax_level_plurals'][fig_taxon]} {fig_measure}")
+        if fig_measure == 'Heip Evenness':
+            fig.update_yaxes(range=(0,1.05))
+        else:
+            fig.update_yaxes(rangemode='tozero')
         fig.update_xaxes(dtick='linear')
-        fig.update_yaxes(title=f'{fig_taxon} Richness', rangemode='tozero')
-        fig.update_layout(title=f'{fig_taxon} Richness')
-        if fig_boxpoints == 'All' and fig_mode == 'Box':
-            fig.update_traces(boxpoints='all', jitter=st.session_state['TTT_jitter'])
-        if fig_boxpoints == 'All' and fig_mode == 'Violin':
-            fig.update_traces(points='all', jitter=st.session_state['TTT_jitter'])
+
+        # Add intrepration guidance
+        if fig_interpration_lines == "Yes" and (fig_measure == 'Heip Evenness' or fig_measure == 'Pielou Evenness'):
+            fig.add_hrect(y0=0.8, y1=1.0, fillcolor="green", opacity=0.2, layer="below", line_width=0)
+            fig.add_hrect(y0=0.5, y1=0.8, fillcolor="yellow", opacity=0.2, layer="below", line_width=0)
+            fig.add_hrect(y0=0.0, y1=0.5, fillcolor="orange", opacity=0.2, layer="below", line_width=0)
 
         # Default Layout
         fig.update_yaxes(title_font=dict(size=fontsize), tickfont=dict(size=fontsize))
@@ -1387,10 +2164,124 @@ def alpha_richness_diagram():
         fig.update_layout(template=template, font_size=fontsize, showlegend=showlegend)
 
         # Plot
-        st.plotly_chart(fig)
+        st.plotly_chart(fig, config=st.session_state['TTT_config'])
 
         # Export
-        export_plot("Alpha_diversity", f"{name}_{fig_mode}_{fig_level}_{fig_taxon}", fig, "plotly")
+        export_plot("Alpha_diversity", f"{name}_{fig_taxon}_{fig_measure}_{fig_mode}", fig, "plotly")
+        export_table("Alpha_diversity", f"{name}_{fig_taxon}_{fig_measure}_{fig_mode}_1", df1, "xlsx", True)
+        export_table("Alpha_diversity", f"{name}_{fig_taxon}_{fig_measure}_{fig_mode}_2", df2, "xlsx", True)
+
+def pycircos_plot():
+
+    # Layout
+    fontsize = st.session_state['TTT_fontsize']
+
+    # Tables
+    name = st.session_state['table_display_name'].stem
+    df_taxon_table = st.session_state['df_taxon_table'].copy()
+    df_samples = st.session_state['df_samples']
+
+
+    # Options
+    fig_taxon0 = st.session_state['pycircos_taxon0'] # Outer Groups
+    fig_taxon1 = st.session_state['pycircos_taxon1'] # Inner Groups
+    fig_taxon2 = st.session_state['pycircos_taxon2'] # Diversity Measure
+    fig_nan = st.session_state['pycircos_nan'] # include or exclude
+    fig_colors = st.session_state['pycircos_colors']
+
+    if fig_taxon2 != 'Hash':
+        df_taxon_table_simple = simple_taxon_table(df_taxon_table)
+    else:
+        df_taxon_table_simple = df_taxon_table.copy()
+
+    # Analysis
+    if fig_nan == 'Exclude':
+        df_taxon_table_simple = df_taxon_table_simple[df_taxon_table_simple[fig_taxon2] != '']
+
+    # Test groups
+    test_groups = [i for i in df_taxon_table_simple[fig_taxon0].unique() if i != '']
+
+    res = {}
+    ## loop through all groups
+    for group in test_groups:
+        # Collect data
+        group_res = []
+        sub_df = df_taxon_table_simple[df_taxon_table_simple[fig_taxon0] == group]
+        taxa = [i for i in sub_df[fig_taxon1].unique() if i != '']
+        if taxa == []:
+            continue
+        total_reads = sub_df[df_samples].sum().sum()
+
+        for taxon in taxa:
+            taxon_df = sub_df[sub_df[fig_taxon1] == taxon]
+            richness = len([i for i in taxon_df[fig_taxon2].unique() if i != ''])
+            n_reads = taxon_df[df_samples].sum().sum()
+            rel_reads = n_reads / total_reads * 100
+            group_res.append([taxon, richness, rel_reads])
+        res_df = pd.DataFrame(group_res, columns=['Taxon', 'Richness', 'Reads'])
+        res[group] = res_df
+
+    sectors = {key:len(values) for key,values in res.items()}
+    circos = Circos(sectors, space=1)
+    for sector, group in zip(circos.sectors, res.keys()):
+        # color
+        if fig_colors == 'custom':
+            color = st.session_state[f'pycircos_colors_{group}']
+            cmap = st.session_state['pycircos_cmaps_dict'][color]
+        else:
+            color = st.session_state['pycircos_colors']
+            cmap = st.session_state['pycircos_cmaps_dict'][color]
+
+        # arrange sector
+        x = np.arange(sector.start, sector.end) + 0.5
+
+        # Add Species heatmap
+        y = res[sector.name]['Richness'].values.tolist()
+        t = res[sector.name]['Taxon'].values.tolist()
+        matrix = np.array([y])
+        r = 51
+        heatmap_track = sector.add_track((r, r+20))
+        heatmap_track.axis()
+        vmax = max(max(matrix))
+        heatmap_track.heatmap(matrix, cmap=cmap, vmin=0, vmax=vmax)
+        heatmap_track.xticks(x, labels=t, label_orientation='vertical', label_size=fontsize)
+
+        # Add labels in between  -> Species
+        y = res[sector.name]['Richness'].values.tolist()
+        heatmap_track = sector.add_track((r, r))
+        heatmap_track.axis()
+        heatmap_track.bar(x, y, color=color, vmin=0, vmax=max(y))
+        heatmap_track.xticks(x, labels=[str(i) for i in y], label_orientation='vertical', label_size=fontsize-2)
+
+        # Add Reads heatmap
+        y = res[sector.name]['Reads'].values.tolist()
+        matrix = np.array([y])
+        r = 28
+        heatmap_track = sector.add_track((r, r+20))
+        heatmap_track.axis()
+        heatmap_track.heatmap(matrix, cmap=cmap, vmin=0, vmax=100)
+
+        # Add labels in between -> Reads
+        y = [round(i,2) for i in res[sector.name]['Reads'].values.tolist()]
+        labels = [str(i) if i >= 0.01 else "<0.01" for i in y]
+        heatmap_track = sector.add_track((r, r))
+        heatmap_track.axis()
+        heatmap_track.bar(x, y, color=color, vmax=100)
+        heatmap_track.xticks(x, labels=labels, label_orientation='vertical', label_size=fontsize-4)
+
+        # Plot inside track
+        r = 21
+        track = sector.add_track((r, r+5))
+        if st.session_state['pycircos_inner_labels'] == 'Show':
+            track.text(sector.name, size=9)
+        track.axis(fc=color, ec="black", alpha=0.5)
+
+    fig = circos.plotfig(figsize=(8, 8))
+    st.pyplot(fig)
+
+    # Export
+    export_plot("Alpha_diversity", f"{name}_circos_{fig_taxon0}_{fig_taxon1}_{fig_taxon2}", fig, "matplot")
+
 ########################################################################################################################
 # Beta Diversity
 
@@ -1404,13 +2295,12 @@ def beta_diversity_matrix():
     # Tables
     name = st.session_state['table_display_name'].stem
     df_taxon_table = st.session_state['df_taxon_table'].copy()
-    df_taxon_table_simple = simple_taxon_table(df_taxon_table)
 
     # Options
     df_metadata_table = st.session_state['df_metadata_table'].copy()
     df_samples = st.session_state['df_samples'].copy()
     fig_labels = st.session_state['betadiv_labels'] # color sequence or scale
-    fig_mode = st.session_state['betadiv_mode'] # spearman or bray curtis
+    fig_mode = st.session_state['betadiv_mode'] # jaccard or bray curtis
     fig_measure = st.session_state['betadiv_measure'] # spearman or bray curtis
     fig_level = st.session_state['betadiv_level'] # sample or metadata
     fig_taxon = st.session_state['betadiv_taxon'] # taxonomic level
@@ -1419,7 +2309,11 @@ def beta_diversity_matrix():
     # Handle Metadata
     if fig_level != 'Samples':
         df_taxon_table, df_samples = concatenate_by_metadata(fig_level)
-    df_taxon_table_simple = simple_taxon_table(df_taxon_table)
+
+    if fig_taxon == 'Hash':
+        df_taxon_table_simple = df_taxon_table.copy()
+    else:
+        df_taxon_table_simple = simple_taxon_table(df_taxon_table)
 
     # Analysis
     if fig_nan == 'Exclude':
@@ -1474,11 +2368,1154 @@ def beta_diversity_matrix():
     fig.update_layout(template=template, font_size=fontsize, showlegend=showlegend)
 
     # Plot
-    st.plotly_chart(fig)
+    st.plotly_chart(fig, config=st.session_state['TTT_config'])
 
     # Export
     export_plot("Beta_diversity", f"{name}_{fig_mode}_{fig_level}_{fig_taxon}", fig, "plotly")
-    export_table("Beta_diversity", f"{name}_{fig_mode}_{fig_level}_{fig_taxon}", df, "xlsx")
+    export_table("Beta_diversity", f"{name}_{fig_mode}_{fig_level}_{fig_taxon}", df, "xlsx", True)
+
+def draw_outlines(fig, x_values, y_values, metadata, color):
+    try:
+        ## collect samples that form the outline
+        x_plane, y_plane = [], []
+        hull = ConvexHull(np.column_stack((x_values, y_values)))
+        for i in hull.vertices:
+            x_plane.append(x_values[i])
+            y_plane.append(y_values[i])
+        x_plane.append(x_values[hull.vertices[0]])
+        y_plane.append(y_values[hull.vertices[0]])
+
+        ## draw the outline
+        fig.add_trace(go.Scatter(x=x_plane, y=y_plane, mode='lines', name=metadata, marker_color=color, fill='toself'))
+    except:
+        pass
+
+def pcoa_calculation():
+
+    # Tables
+    df_taxon_table = st.session_state['df_taxon_table'].copy()
+
+    # Options
+    df_metadata_table = st.session_state['df_metadata_table'].copy()
+    df_samples = st.session_state['df_samples'].copy()
+    fig_mode = st.session_state['pcoa_mode'] # spearman or bray curtis
+    fig_taxon = st.session_state['pcoa_taxon'] # taxonomic level
+    fig_level = st.session_state['pcoa_level']
+
+    # Handle Metadata
+    if fig_level != 'Samples':
+        drop_samples = df_metadata_table[df_metadata_table[fig_level] == '']['Samples'].values.tolist()
+        if len(drop_samples) != 0:
+            df_samples = [i for i in df_samples if i not in drop_samples]
+            df_taxon_table = df_taxon_table.drop(columns=drop_samples, errors='ignore')
+
+    if fig_taxon == 'Hash':
+        df_taxon_table_simple = df_taxon_table.copy()
+    else:
+        df_taxon_table_simple = simple_taxon_table(df_taxon_table)
+    df_taxon_table_simple = df_taxon_table_simple[df_taxon_table_simple[fig_taxon] != '']
+    df_taxon_table_simple_s = (df_taxon_table_simple[[fig_taxon] + df_samples].groupby(fig_taxon, as_index=False).sum())
+    richness_list = {i:df_taxon_table_simple_s[i].values.tolist() for i in df_samples}
+
+    matrix = []
+    if fig_mode == 'Jaccard (qualitative)':
+        for sample1 in df_samples:
+            row = []
+            v1 = [1 if i !=0 else 0 for i in richness_list[sample1]]
+            for sample2 in df_samples:
+                v2 = [1 if i !=0 else 0 for i in richness_list[sample2]]
+                d = distance.jaccard(v1, v2)
+                row.append(d)
+            matrix.append(row)
+    else:
+        for sample1 in df_samples:
+            row = []
+            v1 = richness_list[sample1]
+            for sample2 in df_samples:
+                v2 = richness_list[sample2]
+                d = distance.braycurtis(v1, v2)
+                row.append(d)
+            matrix.append(row)
+
+    # Output Table
+    distance_matrix_df = pd.DataFrame(matrix, columns=df_samples, index=df_samples)
+
+    # Calculate pcoa
+    pcoa_res = pcoa(distance_matrix_df)
+
+    # Collect expained variance
+    pcoa_explained_variance_df = pd.DataFrame(pcoa_res.proportion_explained, columns=['explained_variance']) * 100
+    pcoa_explained_variance_df = pcoa_explained_variance_df[pcoa_explained_variance_df['explained_variance'] > 1]
+
+    # Collect values and already filter for PC axes with >1% explained variance
+    pcoa_df = pd.DataFrame(pcoa_res.samples)
+    pcoa_df.index = df_samples
+    pcoa_axes = list(pcoa_explained_variance_df.index)
+    pcoa_df = pcoa_df[pcoa_axes]
+    explained_variance_df = pd.DataFrame(pcoa_explained_variance_df)
+
+    return pcoa_df, explained_variance_df, distance_matrix_df
+
+def pcoa_plot():
+
+    # Layout
+    fontsize = st.session_state['TTT_fontsize']
+    template = st.session_state['TTT_template']
+    showlegend = st.session_state['TTT_showlegend']
+    scattersize = st.session_state['TTT_scattersize']
+    showlabels = st.session_state['pcoa_showlabels']
+    linewidth = st.session_state['TTT_linewidth']
+
+    # Extract axes to display
+    name = st.session_state['table_display_name'].stem
+    fig_mode = st.session_state['pcoa_mode'] # spearman or bray curtis
+    fig_taxon = st.session_state['pcoa_taxon'] # taxonomic level
+    pcoa_df = st.session_state['pcoa_df']
+    df_samples = pcoa_df.index.tolist()
+    pcoa_explained_variance_dict = st.session_state['pcoa_explained_variance_dict']
+    pcoa_distance_matrix_df = st.session_state['pcoa_distance_matrix_df']
+    pcoa_x = st.session_state['pcoa_x']
+    pcoa_y = st.session_state['pcoa_y']
+    pcoa_z = st.session_state['pcoa_z']
+    pcoa_level = st.session_state['pcoa_level']
+    df_metadata_table = st.session_state['df_metadata_table']
+    sample_categories = [i for i in df_metadata_table[pcoa_level].values.tolist() if i != '']
+
+    # ANOSIM
+    if pcoa_level != 'Samples':
+        dm = DistanceMatrix(pcoa_distance_matrix_df)
+        anosim_result = anosim(dm, sample_categories, permutations=999)
+    else:
+        anosim_result = ''
+
+    ## Display anosim
+    try:
+        r_value = round(anosim_result['test statistic'], 3)
+        p_value = anosim_result['p-value']
+        title = f'{pcoa_level}: ANOSIM R={r_value}, p={p_value}'
+    except:
+        title = f'ANOSIM not calculated'
+
+    color_mode = st.session_state['pcoa_color']
+    if pcoa_level == 'Samples':
+        color_mode = 'Single Color'
+    if color_mode == 'Color scale':
+        colors = get_colors_from_scale(st.session_state['TTT_colorscale'], len(set(sample_categories)))
+        pcoa_df['Group'] = [i for i in df_metadata_table[pcoa_level].values.tolist() if i != '']
+        group_colors = {j: colors[i] for i, j in enumerate(set(sample_categories))}
+        pcoa_df['Colors'] = [group_colors[i] for i in pcoa_df['Group'].values]
+    elif color_mode == 'Color sequence':
+        colors = get_colors_from_sequence(st.session_state['TTT_colorsequence'], len(set(sample_categories)))
+        pcoa_df['Group'] = [i for i in df_metadata_table[pcoa_level].values.tolist() if i != '']
+        group_colors = {j: colors[i] for i, j in enumerate(set(sample_categories))}
+        pcoa_df['Colors'] = [group_colors[i] for i in pcoa_df['Group'].values]
+    else:
+        colors = [st.session_state['TTT_color1']] * len(df_samples)
+        pcoa_df['Colors'] = colors
+        pcoa_df['Group'] = [i for i in df_metadata_table[pcoa_level].values.tolist() if i != '']
+
+    if pcoa_z == 'None':
+        x_title = pcoa_explained_variance_dict[pcoa_x]
+        y_title = pcoa_explained_variance_dict[pcoa_y]
+        pcoa_2D_df = pcoa_df[[x_title, y_title, 'Colors', 'Group']]
+
+        fig = go.Figure()
+
+        for metadata in pcoa_df['Group'].unique():
+            sub_df = pcoa_2D_df.loc[pcoa_2D_df['Group'] == metadata]
+            x_values = sub_df[x_title].values.tolist()
+            y_values = sub_df[y_title].values.tolist()
+            text_values = list(sub_df.index)
+            colors = sub_df['Colors'].values.tolist()
+
+            fig.add_trace(go.Scatter(x=x_values, y=y_values, text=text_values, marker_color=colors, marker=dict(size=scattersize), name=metadata, mode='markers'))
+
+        if pcoa_level != 'Samples' and pcoa_groups == 'Outlines':
+            for category in set(pcoa_df['Group'].values.tolist()):
+                sub_df = pcoa_df.loc[pcoa_df['Group'] == category]
+                if len(sub_df) >= 2:
+                    x_values = sub_df[x_title].values.tolist()
+                    y_values = sub_df[y_title].values.tolist()
+                    color = sub_df['Colors'].drop_duplicates().values.tolist()[0]
+                    draw_outlines(fig, x_values, y_values, category, color)
+
+        elif pcoa_level != 'Samples' and pcoa_groups == 'Continous':
+            x_values = pcoa_df[x_title].values.tolist()
+            y_values = pcoa_df[y_title].values.tolist()
+            fig.add_trace(go.Scatter(x=x_values, y=y_values, marker=dict(color=st.session_state['TTT_color1']), line=dict(width=linewidth), mode='lines'))
+
+        if showlabels != 'Hide':
+            x_values = pcoa_df[x_title].values.tolist()
+            y_values = pcoa_df[y_title].values.tolist()
+            t_values = list(pcoa_df.index)
+            fig.add_trace(go.Scatter(x=x_values, y=y_values, text=t_values, textposition=showlabels, mode='text'))
+
+        # Update layout
+        fig.update_xaxes(title=pcoa_x)
+        fig.update_yaxes(title=pcoa_y)
+        fig.update_layout(title=title,
+                          template=template,
+                          font_size=fontsize,
+                          showlegend=showlegend,
+                          yaxis_title_font=dict(size=fontsize),
+                          yaxis_tickfont=dict(size=fontsize),
+                          xaxis_title_font=dict(size=fontsize),
+                          xaxis_tickfont=dict(size=fontsize))
+
+        # Plot
+        st.plotly_chart(fig, config=st.session_state['TTT_config'])
+        export_plot("Beta_diversity", f"{name}_{fig_mode}_{fig_taxon}", fig, "plotly")
+        export_table("Beta_diversity", f"{name}_{fig_mode}_{fig_taxon}", pcoa_df, "xlsx")
+
+def nmds_calculation():
+
+    # Tables
+    df_taxon_table = st.session_state['df_taxon_table'].copy()
+
+    # Options
+    df_metadata_table = st.session_state['df_metadata_table'].copy()
+    df_samples = st.session_state['df_samples'].copy()
+    fig_mode = st.session_state['nmds_mode'] # spearman or bray curtis
+    fig_taxon = st.session_state['nmds_taxon'] # taxonomic level
+    fig_level = st.session_state['nmds_level']
+    nmds_axes = st.session_state['nmds_axes']
+
+    # Handle Metadata
+    if fig_level != 'Samples':
+        drop_samples = df_metadata_table[df_metadata_table[fig_level] == '']['Samples'].values.tolist()
+        if len(drop_samples) != 0:
+            df_samples = [i for i in df_samples if i not in drop_samples]
+            df_taxon_table = df_taxon_table.drop(columns=drop_samples, errors='ignore')
+
+    if fig_taxon == 'Hash':
+        df_taxon_table_simple = df_taxon_table.copy()
+    else:
+        df_taxon_table_simple = simple_taxon_table(df_taxon_table)
+    df_taxon_table_simple = df_taxon_table_simple[df_taxon_table_simple[fig_taxon] != '']
+    df_taxon_table_simple_s = (df_taxon_table_simple[[fig_taxon] + df_samples].groupby(fig_taxon, as_index=False).sum())
+    richness_list = {i:df_taxon_table_simple_s[i].values.tolist() for i in df_samples}
+
+    matrix = []
+    if fig_mode == 'Jaccard (qualitative)':
+        for sample1 in df_samples:
+            row = []
+            v1 = [1 if i !=0 else 0 for i in richness_list[sample1]]
+            for sample2 in df_samples:
+                v2 = [1 if i !=0 else 0 for i in richness_list[sample2]]
+                d = distance.jaccard(v1, v2)
+                row.append(d)
+            matrix.append(row)
+    else:
+        for sample1 in df_samples:
+            row = []
+            v1 = richness_list[sample1]
+            for sample2 in df_samples:
+                v2 = richness_list[sample2]
+                d = distance.braycurtis(v1, v2)
+                row.append(d)
+            matrix.append(row)
+
+    # Output Table
+    distance_matrix_df = pd.DataFrame(matrix, columns=df_samples, index=df_samples)
+
+    # Calculate pcoa
+    nmds = MDS(
+        n_components=nmds_axes,
+        metric=False,
+        dissimilarity="precomputed",
+        random_state=42,
+        n_init=10,
+        max_iter=3000)
+
+    coords = nmds.fit_transform(distance_matrix_df.values)
+    if nmds_axes == 2:
+        nmds_df = pd.DataFrame(coords, index=df_samples, columns=["NMDS1", "NMDS2"])
+    else:
+        nmds_df = pd.DataFrame(coords, index=df_samples, columns=["NMDS1", "NMDS2", "NMDS3"])
+    nmds_stress = nmds.stress_
+
+    return nmds_df, nmds_stress
+
+def nmds_plot():
+
+    # Layout
+    fontsize = st.session_state['TTT_fontsize']
+    template = st.session_state['TTT_template']
+    showlegend = st.session_state['TTT_showlegend']
+    scattersize = st.session_state['TTT_scattersize']
+    showlabels = st.session_state['nmds_showlabels']
+    linewidth = st.session_state['TTT_linewidth']
+    nmds_axes = st.session_state['nmds_axes']
+
+    # Extract axes to display
+    name = st.session_state['table_display_name'].stem
+    fig_mode = st.session_state['nmds_mode'] # spearman or bray curtis
+    fig_taxon = st.session_state['nmds_taxon'] # taxonomic level
+    nmds_level = st.session_state['nmds_level']
+    nmds_df = st.session_state['nmds_df']
+    nmds_stress = st.session_state['nmds_stress']
+
+    df_samples = nmds_df.index.tolist()
+    df_metadata_table = st.session_state['df_metadata_table']
+    sample_categories = [i for i in df_metadata_table[nmds_level].values.tolist() if i != '']
+
+    # Create a title
+    title = f'Stress: {nmds_stress:.3}'
+
+    color_mode = st.session_state['nmds_color']
+    if nmds_level == 'Samples':
+        color_mode = 'Single Color'
+    if color_mode == 'Color scale':
+        colors = get_colors_from_scale(st.session_state['TTT_colorscale'], len(set(sample_categories)))
+        nmds_df['Group'] = [i for i in df_metadata_table[nmds_level].values.tolist() if i != '']
+        group_colors = {j: colors[i] for i, j in enumerate(set(sample_categories))}
+        nmds_df['Colors'] = [group_colors[i] for i in nmds_df['Group'].values]
+    elif color_mode == 'Color sequence':
+        colors = get_colors_from_sequence(st.session_state['TTT_colorsequence'], len(set(sample_categories)))
+        nmds_df['Group'] = [i for i in df_metadata_table[nmds_level].values.tolist() if i != '']
+        group_colors = {j: colors[i] for i, j in enumerate(set(sample_categories))}
+        nmds_df['Colors'] = [group_colors[i] for i in nmds_df['Group'].values]
+    else:
+        colors = [st.session_state['TTT_color1']] * len(df_samples)
+        nmds_df['Colors'] = colors
+        nmds_df['Group'] = [i for i in df_metadata_table[nmds_level].values.tolist() if i != '']
+
+    if nmds_axes == 2:
+        x_title = 'NMDS1'
+        y_title = 'NMDS2'
+        nmds_2D_df = nmds_df[[x_title, y_title, 'Colors', 'Group']]
+
+        fig = go.Figure()
+
+        for metadata in nmds_df['Group'].unique():
+            sub_df = nmds_2D_df.loc[nmds_2D_df['Group'] == metadata]
+            x_values = sub_df[x_title].values.tolist()
+            y_values = sub_df[y_title].values.tolist()
+            text_values = list(sub_df.index)
+            colors = sub_df['Colors'].values.tolist()
+
+            fig.add_trace(go.Scatter(x=x_values, y=y_values, text=text_values, marker_color=colors, marker=dict(size=scattersize), name=metadata, mode='markers'))
+
+        if nmds_level != 'Samples' and nmds_groups == 'Outlines':
+            for category in set(nmds_df['Group'].values.tolist()):
+                sub_df = nmds_df.loc[nmds_df['Group'] == category]
+                if len(sub_df) >= 2:
+                    x_values = sub_df[x_title].values.tolist()
+                    y_values = sub_df[y_title].values.tolist()
+                    color = sub_df['Colors'].drop_duplicates().values.tolist()[0]
+                    draw_outlines(fig, x_values, y_values, category, color)
+
+        elif nmds_level != 'Samples' and nmds_groups == 'Continous':
+            x_values = nmds_df[x_title].values.tolist()
+            y_values = nmds_df[y_title].values.tolist()
+            fig.add_trace(go.Scatter(x=x_values, y=y_values, marker=dict(color=st.session_state['TTT_color1']), line=dict(width=linewidth), mode='lines'))
+
+        if showlabels != 'Hide':
+            x_values = nmds_df[x_title].values.tolist()
+            y_values = nmds_df[y_title].values.tolist()
+            t_values = list(nmds_df.index)
+            fig.add_trace(go.Scatter(x=x_values, y=y_values, text=t_values, textposition=showlabels, mode='text'))
+
+        # Update layout
+        fig.update_xaxes(title=x_title)
+        fig.update_yaxes(title=y_title)
+        fig.update_layout(title=title,
+                          template=template,
+                          font_size=fontsize,
+                          showlegend=showlegend,
+                          yaxis_title_font=dict(size=fontsize),
+                          yaxis_tickfont=dict(size=fontsize),
+                          xaxis_title_font=dict(size=fontsize),
+                          xaxis_tickfont=dict(size=fontsize))
+
+        # Plot
+        st.plotly_chart(fig, config=st.session_state['TTT_config'])
+        export_plot("Beta_diversity", f"{name}_{fig_mode}_{fig_taxon}", fig, "plotly")
+        export_table("Beta_diversity", f"{name}_{fig_mode}_{fig_taxon}", nmds_df, "xlsx")
+
+    else:
+        x_title = 'NMDS1'
+        y_title = 'NMDS2'
+        z_title = 'NMDS3'
+        nmds_2D_df = nmds_df[[x_title, y_title, z_title, 'Colors', 'Group']]
+
+        fig = go.Figure()
+
+        for metadata in nmds_df['Group'].unique():
+            sub_df = nmds_2D_df.loc[nmds_2D_df['Group'] == metadata]
+            x_values = sub_df[x_title].values.tolist()
+            y_values = sub_df[y_title].values.tolist()
+            z_values = sub_df[z_title].values.tolist()
+            text_values = list(sub_df.index)
+            colors = sub_df['Colors'].values.tolist()
+
+            fig.add_trace(go.Scatter3d(x=x_values, y=y_values, z=z_values, text=text_values, marker_color=colors, marker=dict(size=scattersize), name=metadata, mode='markers'))
+
+        # Update layout
+        fig.update_xaxes(title=x_title)
+        fig.update_yaxes(title=y_title)
+        fig.update_layout(title=title,
+                          template=template,
+                          font_size=fontsize,
+                          showlegend=showlegend,
+                          yaxis_title_font=dict(size=fontsize),
+                          yaxis_tickfont=dict(size=fontsize),
+                          xaxis_title_font=dict(size=fontsize),
+                          xaxis_tickfont=dict(size=fontsize))
+
+        # Plot
+        st.plotly_chart(fig, config=st.session_state['TTT_config'])
+        export_plot("Beta_diversity", f"{name}_{fig_mode}_{fig_taxon}", fig, "plotly")
+        export_table("Beta_diversity", f"{name}_{fig_mode}_{fig_taxon}", nmds_df, "xlsx")
+
+########################################################################################################################
+# Time Series
+def time_series_richness():
+
+    # Layout
+    fontsize = st.session_state['TTT_fontsize']
+    template = st.session_state['TTT_template']
+    showlegend = st.session_state['TTT_showlegend']
+    scattersize = st.session_state['TTT_scattersize']
+    linewidth = st.session_state['TTT_linewidth']
+    scattersize = st.session_state['TTT_scattersize']
+    color1 = st.session_state['TTT_color1']
+    color2 = st.session_state['TTT_color2']
+
+    # Tables
+    name = st.session_state['table_display_name'].stem
+    df_taxon_table = st.session_state['df_taxon_table'].copy()
+    df_samples = st.session_state['df_samples']
+
+    # Options
+    fig_level = st.session_state['ts_level']
+    fig_taxon = st.session_state['ts_taxon']
+    fig_confidence_interval = st.session_state['ts_ci']
+    fig_bootstraps = st.session_state['ts_bootstraps']
+
+    # Handle Metadata
+    if fig_level != 'Samples':
+        df_taxon_table, df_samples = concatenate_by_metadata(fig_level)
+
+    if fig_taxon != 'Hash':
+        df_taxon_table_simple = simple_taxon_table(df_taxon_table)
+    else:
+        df_taxon_table_simple = df_taxon_table.copy()
+
+    # Remove all 'nan'
+    df_taxon_table_simple = df_taxon_table_simple[df_taxon_table_simple[fig_taxon] != '']
+
+    # Prepare x-values and y-values (using actual sample names as x-values)
+    x_values = []
+    y_values = []
+    for sample in df_samples:
+        sub_df = df_taxon_table_simple[[fig_taxon, sample]]
+        measure = len(sub_df[sub_df[sample] != 0].values.tolist())
+        x_values.append(sample)
+        y_values.append(measure)
+
+    # Plot original data points
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=x_values, y=y_values, name='Original Data', mode='markers', marker=dict(color=color1, size=scattersize)))
+
+    # Calculate LOESS (Locally Estimated Scatterplot Smoothing) for the original data
+    # Since x_values are now sample names, we need numerical indices for LOESS smoothing
+    x_numeric = list(range(len(x_values)))
+    loess_smoothed = sm.nonparametric.lowess(endog=y_values, exog=x_numeric, frac=0.3)
+    loess_x_numeric = loess_smoothed[:, 0]
+    loess_y = loess_smoothed[:, 1]
+
+    # Map numerical x-values back to sample names
+    loess_x = [x_values[int(i)] for i in loess_x_numeric]
+
+    # Add LOESS-smoothed line to the plot
+    fig.add_trace(go.Scatter(x=loess_x, y=loess_y, name='LOESS Smoothing', mode='lines', line=dict(color=color2, width=linewidth)))
+
+    # Bootstrapping to calculate confidence intervals
+    bootstrapped_fits = []
+    for _ in range(fig_confidence_interval):
+        # Resample the data with replacement
+        resample_indices = np.random.choice(range(len(x_numeric)), size=len(x_numeric), replace=True)
+        resample_x_numeric = np.array(x_numeric)[resample_indices]
+        resample_y = np.array(y_values)[resample_indices]
+
+        # Fit LOESS on resampled data
+        loess_bootstrap = sm.nonparametric.lowess(endog=resample_y, exog=resample_x_numeric, frac=0.3)
+
+        # Interpolate to original x-numeric values
+        interp_bootstrap_y = np.interp(x_numeric, loess_bootstrap[:, 0], loess_bootstrap[:, 1])
+        bootstrapped_fits.append(interp_bootstrap_y)
+
+    # Convert list to numpy array for easier calculations
+    bootstrapped_fits = np.array(bootstrapped_fits)
+
+    # Calculate the confidence intervals (CI) at each x-value
+    lower_bound = np.percentile(bootstrapped_fits, (100 - fig_confidence_interval) / 2, axis=0)
+    upper_bound = np.percentile(bootstrapped_fits, 100 - (100 - fig_confidence_interval) / 2, axis=0)
+
+    # Add shaded region for the confidence interval
+    fig.add_trace(go.Scatter(
+        x=x_values + x_values[::-1],  # x values forward and backward for the fill area
+        y=np.concatenate([upper_bound, lower_bound[::-1]]),  # upper bound followed by reversed lower bound
+        fill='toself',
+        fillcolor='rgba(0,100,80,0.2)',  # Semi-transparent color
+        line=dict(color='rgba(255,255,255,0)'),
+        showlegend=False,
+        name=f'{fig_confidence_interval}% Confidence Interval'
+    ))
+
+    # Calculate Spearman correlations
+    rho1, p1 = stats.spearmanr([i for i,j in enumerate(x_values)], y_values)
+    rho1, p1 = convert_r_p(rho1, p1)
+
+    rho2, p2 = stats.spearmanr([i for i,j in enumerate(x_values)], loess_y)
+    rho2, p2 = convert_r_p(rho2, p2)
+
+    annotation_text = (
+        f"<b>Spearman correlation</b><br>"
+        f"Original data: ρ = {rho1} (p={p1})<br>"
+        f"LOESS data: ρ = {rho2} (p={p2})"
+    )
+
+    fig.add_annotation(
+        text=annotation_text,
+        xref="paper",
+        yref="paper",
+        x=0,
+        y=1,
+        xanchor="left",
+        yanchor="bottom",
+        showarrow=False,
+        align="left"
+    )
+
+
+    if fig_taxon == 'Hash':
+        fig_taxon = st.session_state['TTT_hash'][:-1]
+
+    # Default Layout
+    fig.update_yaxes(title_font=dict(size=fontsize), tickfont=dict(size=fontsize), title=f'{fig_taxon} Richness', rangemode='tozero')
+    fig.update_xaxes(title_font=dict(size=fontsize), tickfont=dict(size=fontsize), dtick='linear')
+    fig.update_layout(template=template, font_size=fontsize, showlegend=showlegend)
+    fig.update_xaxes(type="category",range=[-0.5, len(x_values) - 0.5])
+
+    # Create df
+    df = pd.DataFrame()
+    df['Samples (in order)'] = x_values
+    df[f'{fig_taxon} Richness'] = y_values
+    df[f'{fig_taxon} Richness (LOESS)'] = loess_y
+
+    # Plot
+    st.plotly_chart(fig, config=st.session_state['TTT_config'])
+    export_plot("Time_series", f"{name}_{fig_taxon}", fig, "plotly")
+    export_table("Time_series", f"{name}_{fig_taxon}", df, "xlsx")
+
+########################################################################################################################
+# API
+def gbif_accession():
+
+    ## create copies of the dataframes
+    df_taxon_table = st.session_state['df_taxon_table'].copy()
+    df_metadata_table = st.session_state['df_metadata_table'].copy()
+    table_display_name = st.session_state['table_display_name']
+
+    ## store results here
+    species_dict = {'': ['', '', '', '', '']}
+    OTU_species = []
+    OTU_keys = []
+    OTU_genusKeys = []
+    OTU_synonyms = []
+    OTU_iucnRedListCategory = []
+    OTU_habitat = []
+    OTU_gbif_link = []
+
+    for row in stqdm(df_taxon_table.values.tolist()):
+        species = row[7]
+
+        ## request GBIF
+        if species != '':
+            if species not in species_dict.keys():
+                query = species.replace(' ', '%20')
+                # Initialize a counter for the number of attempts
+                attempts = 0
+                # Initialize a flag for whether the request was successful
+                success = False
+
+                while not success and attempts < 20:
+                    try:
+                        # Make a GET request to the API
+                        response = requests.get(f'https://api.gbif.org/v1/species/match?name={query}')
+
+                        # If the request was successful, parse the response text as JSON
+                        if response.status_code == 200:
+                            data = json.loads(response.text)
+                            success = True
+                        else:
+                            attempts += 1
+                    except requests.exceptions.RequestException as e:
+                        # If there was a network problem (e.g. DNS resolution, refused connection, etc), increment the counter and try again
+                        attempts += 1
+
+                # If the request was not successful after 20 attempts, print a warning
+                if not success:
+                    species_dict[species] = [''] * 6
+                else:
+                    # add data to dict
+                    species_dict[species] = [data.get('species', ''), data.get('speciesKey', ''),
+                                             data.get('genusKey', ''), data.get('synonym', '')]
+
+                    # Make a GET request to the API to get IUCN Red List Category
+                    response = requests.get(
+                        f"https://api.gbif.org/v1/species/{data.get('speciesKey', '')}/iucnRedListCategory")
+                    if response.status_code == 200:
+                        iucn_data = json.loads(response.text)
+                        species_dict[species].append(iucn_data.get('code', ''))
+                    else:
+                        species_dict[species].append('')
+
+                    # Make a GET request to the API to get habitat
+                    response = requests.get(
+                        f"https://api.gbif.org/v1/species/{data.get('speciesKey', '')}/speciesProfiles")
+                    if response.status_code == 200:
+                        habitat_data = json.loads(response.text)
+                        habitat = ', '.join([j for j in sorted(set([i.get('habitat', '').lower() for i in habitat_data['results']])) if j != ''])
+                        species_dict[species].append(habitat)
+                    else:
+                        species_dict[species].append('')
+
+                time.sleep(0.5)
+
+            # create link
+            gbif_url = f'https://www.gbif.org/species/{str(species_dict[species][1])}'
+
+            ## append results
+            OTU_species.append(species_dict[species][0])
+            OTU_keys.append(str(species_dict[species][1]))
+            OTU_genusKeys.append(str(species_dict[species][2]))
+            OTU_synonyms.append(str(species_dict[species][3]))
+            OTU_iucnRedListCategory.append(species_dict[species][4])
+            OTU_habitat.append(species_dict[species][5])
+            OTU_gbif_link.append(gbif_url)
+        else:
+            ## append results
+            OTU_species.append('')
+            OTU_keys.append('')
+            OTU_genusKeys.append('')
+            OTU_synonyms.append('')
+            OTU_iucnRedListCategory.append('')
+            OTU_habitat.append('')
+            OTU_gbif_link.append('')
+
+    ## append to traits df
+    similarity_loc = df_taxon_table.columns.tolist().index('Similarity')+1
+    df_taxon_table.insert(loc=similarity_loc, column='speciesKey', value=OTU_keys)
+    df_taxon_table.insert(loc=similarity_loc, column='genusKey', value=OTU_genusKeys)
+    df_taxon_table.insert(loc=similarity_loc, column='GBIF species', value=OTU_species)
+    df_taxon_table.insert(loc=similarity_loc, column='Synonym', value=OTU_synonyms)
+    df_taxon_table.insert(loc=similarity_loc, column='iucnRedListCategory', value=OTU_iucnRedListCategory)
+    df_taxon_table.insert(loc=similarity_loc, column='Habitat', value=OTU_habitat)
+    df_taxon_table.insert(loc=similarity_loc, column='GBIF', value=OTU_gbif_link)
+
+    ## export table
+    export_taxon_table(table_display_name, df_taxon_table, df_metadata_table, '')
+    st.session_state['df_taxon_table'] = df_taxon_table.copy()
+    st.success('GBIF Data was implemented!')
+
+def gbif_upload_conversion():
+    df_taxon_table = st.session_state['df_taxon_table'].copy()
+    df_metadata_table = st.session_state['df_metadata_table'].copy()
+    table_display_name = st.session_state['table_display_name']
+    df_samples = st.session_state['df_samples']
+
+    # Create OTU Table (Sheet)
+    OTU_table = df_taxon_table[df_samples]
+    OTU_table.index = df_taxon_table['Hash']
+    OTU_table.index.name = ''
+
+    # Create Taxonomy Table (Sheet)
+    taxonomy_table = df_taxon_table[['Hash', 'Seq', 'Species', 'Kingdom', 'Phylum', 'Class', 'Order', 'Family', 'Genus']].copy()
+    taxonomy_table.columns = ['id', 'DNA_sequence', 'scientificName', 'kingdom', 'phylum', 'class', 'order', 'family', 'genus']
+
+    # Create Samples Table (Sheet)
+    samples_table = pd.DataFrame(df_samples, columns=['id'])
+    samples_table['decimalLatitude'] = ''
+    samples_table['decimalLongitude'] = ''
+    samples_table['eventDate'] = ''
+
+    # Create Study Table (Sheet)
+    study_table = pd.DataFrame([['target_gene', ''],
+                                ['pcr_primer_forward', 'ACGT'],
+                                ['pcr_primer_name_forward', ''],
+                                ['pcr_primer_reverse', 'ACGT'],
+                                ['pcr_primer_name_reverse', ''],
+                                ], columns=['term', 'value'])
+
+    active_project_path = st.session_state['active_project_path']
+    folder_name = 'GBIF'
+    os.makedirs(active_project_path / folder_name, exist_ok=True)
+    export_file = active_project_path / folder_name / f"GBIF_Upload_{table_display_name.name}"
+    with pd.ExcelWriter(export_file, engine="xlsxwriter") as writer:
+        OTU_table.to_excel(writer, sheet_name='OTU_table', index=True)
+        taxonomy_table.to_excel(writer, sheet_name='Taxonomy', index=False)
+        samples_table.to_excel(writer, sheet_name='Samples', index=False)
+        study_table.to_excel(writer, sheet_name='Study', index=False)
+
+    st.success('GBIF Upload Table was created!')
+
+########################################################################################################################
+# ESC calculation
+
+def convert_to_perlodes(path_to_outdirs, taxon_table_xlsx, taxon_table_df, samples, metadata_df, traits_df, tool_settings):
+    # Make copies of input dataframes to prevent altering the originals
+    taxon_table_df = taxon_table_df.copy()
+    metadata_df = metadata_df.copy()
+    river_types_dict = {i:j for i,j in metadata_df[['Sample', 'Perlodes_river_type']].values.tolist()}
+    taxa_list_dict = {i:j for i,j in metadata_df[['Sample', 'Perlodes_taxa_list']].values.tolist()}
+    usage_dict = {i:j for i,j in metadata_df[['Sample', 'Perlodes_usage']].values.tolist()}
+
+    # Ensure all samples have metadata in all three categories
+    samples = [
+        i for i in samples
+        if i in river_types_dict and pd.notna(river_types_dict[i]) and
+           i in taxa_list_dict and pd.notna(taxa_list_dict[i]) and
+           i in usage_dict and pd.notna(usage_dict[i])
+            ]
+
+    if len(samples) == 0:
+        st.warning('Please fill out the required metadata for at least one sample!')
+        return
+
+    # Extract relevant settings from the tool settings
+    presence_absence = tool_settings['presence_absence']
+    taxon_table_taxonomy = taxon_table_df.columns.tolist()[1:7]
+
+    all_reads = []
+    for sample in samples:
+        total_reads = taxon_table_df[sample].sum()
+        taxon_dict = {}
+        for OTU in taxon_table_df[taxon_table_taxonomy + [sample]].values.tolist():
+            taxon = [item for item in OTU[0:6] if item != ''][-1]
+            if taxon not in taxon_dict.keys():
+                n_reads = OTU[-1]
+                taxon_dict[taxon] = n_reads
+            else:
+                n_reads = OTU[-1]
+                taxon_dict[taxon] = taxon_dict[taxon] + n_reads
+        if presence_absence == True:
+            pa_list = [1 if i != 0 else 0 for i in taxon_dict.values()]
+            all_reads.append(pa_list)
+        elif presence_absence == 'Relative':
+            rel_list = [round(i / total_reads * 100, 2) for i in taxon_dict.values()]
+            all_reads.append(rel_list)
+        else:
+            all_reads.append(list(taxon_dict.values()))
+
+    # create initial df
+    index = [i for i in range(1,1+len(taxon_dict.keys()))]
+    species = list(taxon_dict.keys())
+    perlodes_df = pd.DataFrame(species, columns=['species'])
+    perlodes_df.insert(0, '', index)
+    perlodes_df = pd.concat([perlodes_df, pd.DataFrame(all_reads, index=samples).transpose()], axis=1)
+
+    # convert the df to match the (complicated) perlodes input format
+    columns = ['ID_ART', 'TAXON_NAME'] + samples
+    gewässertyp = ['Gewässertyp', ''] + [river_types_dict[i] for i in samples]
+    Taxaliste = ['Taxaliste', ''] + [taxa_list_dict[i] for i in samples]
+    Nutzung = ['Nutzung', ''] + [usage_dict[i] for i in samples]
+    taxa = [[1] + i[1:] for i in perlodes_df.values.tolist()]
+    df_list = [gewässertyp] + [Taxaliste] + [Nutzung] + taxa
+    perlodes_input_df = pd.DataFrame(df_list, columns=columns)
+
+    # write the filtered list to a dataframe
+    if presence_absence == True:
+        perlodes_directory = Path(str(path_to_outdirs) + "/" + "Perlodes" + "/" + taxon_table_xlsx.stem)
+        perlodes_xlsx = Path(str(perlodes_directory) + "_Perlodes_PA.xlsx")
+        perlodes_input_df.to_excel(perlodes_xlsx, index=False)
+    elif presence_absence == 'Relative':
+        perlodes_directory = Path(str(path_to_outdirs) + "/" + "Perlodes" + "/" + taxon_table_xlsx.stem)
+        perlodes_xlsx = Path(str(perlodes_directory) + "_Perlodes_RELATIVE_ABUNDANCE.xlsx")
+        perlodes_input_df.to_excel(perlodes_xlsx, index=False)
+    else:
+        perlodes_directory = Path(str(path_to_outdirs) + "/" + "Perlodes" + "/" + taxon_table_xlsx.stem)
+        perlodes_xlsx = Path(str(perlodes_directory) + "_Perlodes_ABUNDANCE.xlsx")
+        perlodes_input_df.to_excel(perlodes_xlsx, index=False)
+
+    st.success(f'Wrote Perlodes input file to: {perlodes_xlsx}')
+
+def convert_to_phylib(path_to_outdirs, taxon_table_xlsx, taxon_table_df, samples, metadata_df, traits_df, tool_settings):
+
+    #get the taxonomy from the operational taxon list
+    operational_taxon_list_df = pd.read_excel(Path(operational_taxon_list), sheet_name="TTT import").fillna('')
+
+    # load the taxon table and create a list
+    TaXon_table_xlsx = Path(TaXon_table_xlsx)
+    TaXon_table_df = pd.read_excel(TaXon_table_xlsx).fillna('')
+    meta_data_df = collect_metadata(TaXon_table_df)
+    TaXon_table_df = strip_metadata(TaXon_table_df)
+    TaXon_table_taxonomy = TaXon_table_df.columns.tolist()[0:7]
+    samples_list = TaXon_table_df.columns.tolist()[10:]
+
+    ## load the metadata -> freshwater type
+    Meta_data_table_xlsx = Path(str(path_to_outdirs) + "/" + "Meta_data_table" + "/" + TaXon_table_xlsx.stem + "_metadata.xlsx")
+    Meta_data_table_df = pd.read_excel(Meta_data_table_xlsx, header=0).fillna("")
+    Meta_data_table_samples = Meta_data_table_df['Samples'].tolist()
+    metadata_loc = Meta_data_table_df.columns.tolist().index(meta_data_to_test)
+    types_dict = {i[0]:i[1] for i in Meta_data_table_df[['Samples', meta_data_to_test]].values.tolist()}
+
+    ## drop samples with metadata called nan (= empty)
+    drop_samples = [i[0] for i in Meta_data_table_df.values.tolist() if i[metadata_loc] == ""]
+
+    ## test if samples have metadata
+    if drop_samples != []:
+        sg.PopupError("Please fill out all the metadata for all samples.")
+
+    ## test if all metadata for Phylib is available
+    elif len(set([True if i in Meta_data_table_df.columns.tolist() else False for i in ['Ökoregion', 'Makrophytenverödung', 'Begründung', 'Helophytendominanz', 'Diatomeentyp', 'Phytobenthostyp', 'Makrophytentyp', 'WRRL-Typ', 'Gesamtdeckungsgrad']])) != 1:
+        sg.PopupError("Please fill out all the required phylib metadata for all samples.")
+
+    elif sorted(Meta_data_table_samples) == sorted(samples_list):
+        # store hits and dropped OTUs
+        hit_list, dropped_list = [], []
+
+        # loop through the taxon table
+        for taxonomy in TaXon_table_df[TaXon_table_taxonomy].values.tolist():
+            ## test species
+            if taxonomy[6] != '' and taxonomy[6] in operational_taxon_list_df['Species'].values.tolist():
+                ## merge the OTU's taxonomy with OTL information
+                res = taxonomy + operational_taxon_list_df[operational_taxon_list_df['Species'].str.contains(taxonomy[6])][['DV-NR.', 'Taxon']].values.tolist()[0]
+
+            ## test genus
+            elif taxonomy[5] != '' and taxonomy[5] in operational_taxon_list_df['Genus'].values.tolist():
+                ## merge the OTU's taxonomy with OTL information
+                res = taxonomy + operational_taxon_list_df[operational_taxon_list_df['Genus'].str.contains(taxonomy[5])][['DV-NR.', 'Taxon']].values.tolist()[0]
+
+            ## test family
+            elif taxonomy[4] != '' and taxonomy[4] in operational_taxon_list_df['Family'].values.tolist():
+                ## merge the OTU's taxonomy with OTL information
+                res = taxonomy + operational_taxon_list_df[operational_taxon_list_df['Family'].str.contains(taxonomy[4])][['DV-NR.', 'Taxon']].values.tolist()[0]
+
+            ## test order
+            elif taxonomy[3] != '' and taxonomy[3] in operational_taxon_list_df['Order'].values.tolist():
+                ## merge the OTU's taxonomy with OTL information
+                res = taxonomy + operational_taxon_list_df[operational_taxon_list_df['Order'].str.contains(taxonomy[3])][['DV-NR.', 'Taxon']].values.tolist()[0]
+
+            ## test class
+            elif taxonomy[2] != '' and taxonomy[2] in operational_taxon_list_df['Class'].values.tolist():
+                ## merge the OTU's taxonomy with OTL information
+                res = taxonomy + operational_taxon_list_df[operational_taxon_list_df['Class'].str.contains(taxonomy[2])][['DV-NR.', 'Taxon']].values.tolist()[0]
+
+            ## test phylum
+            elif taxonomy[1] != '' and taxonomy[1] in operational_taxon_list_df['Phylum'].values.tolist():
+                ## merge the OTU's taxonomy with OTL information
+                res = taxonomy + operational_taxon_list_df[operational_taxon_list_df['Phylum'].str.contains(taxonomy[1])][['DV-NR.', 'Taxon']].values.tolist()[0]
+            else:
+                res = taxonomy + ['', '']
+                dropped_list.append(taxonomy)
+
+            hit_list.append(res)
+
+        ## create a dataframe
+        ## create a new df and export it as TaXon table
+        df = pd.DataFrame(hit_list, columns=TaXon_table_df.columns[0:7].values.tolist() + ['DV-NR.', 'Taxon (Phylib)'])
+        concatenated_df = pd.concat([df, TaXon_table_df[samples_list + ['Similarity', 'Status', 'seq']]], axis=1)
+        reordered_df = concatenated_df[['ID', 'Phylum', 'Class', 'Order', 'Family', 'Genus', 'Species', 'Similarity', 'Status', 'DV-NR.', 'Taxon (Phylib)', 'seq'] + samples_list]
+        reordered_metadata_df = add_metadata(reordered_df, meta_data_df)
+        phylib_TaXon_Table = Path(str(path_to_outdirs) + "/" + "TaXon_tables" + "/" + TaXon_table_xlsx.stem + "_phylib.xlsx")
+        reordered_metadata_df.to_excel(phylib_TaXon_Table, index=False)
+
+        # create an output list for phylib
+        messwerte_list = []
+        messtellen_list = []
+
+        for sample in samples_list:
+            ## collect information about the sampling site
+            sample_metadata_df = Meta_data_table_df.loc[Meta_data_table_df['Samples'] == sample]
+            messstelle = sample
+            ökoregion = sample_metadata_df['Ökoregion'].values.tolist()[0]
+            Makrophytenverödung = sample_metadata_df['Makrophytenverödung'].values.tolist()[0]
+            Begründung = sample_metadata_df['Begründung'].values.tolist()[0]
+            Helophytendominanz = sample_metadata_df['Helophytendominanz'].values.tolist()[0]
+            Diatomeentyp = sample_metadata_df['Diatomeentyp'].values.tolist()[0]
+            Phytobenthostyp = sample_metadata_df['Phytobenthostyp'].values.tolist()[0]
+            Makrophytentyp = sample_metadata_df['Makrophytentyp'].values.tolist()[0]
+            WRRL_Typ = sample_metadata_df['WRRL-Typ'].values.tolist()[0]
+            Gesamtdeckungsgrad = sample_metadata_df['Gesamtdeckungsgrad'].values.tolist()[0]
+            messtellen_list.append([messstelle, ökoregion, Makrophytenverödung, Begründung, Helophytendominanz, Diatomeentyp, Phytobenthostyp, Makrophytentyp, WRRL_Typ, Gesamtdeckungsgrad])
+
+            ## calcualte sum of reads for taxa with multiple OTUs
+            sample_df = reordered_metadata_df[[sample, 'DV-NR.', 'Taxon (Phylib)']]
+            reads_dict = {}
+            for taxon in sample_df.values.tolist():
+                key = taxon[2]
+                values = taxon[:2]
+                if key != '':
+                    if key not in reads_dict.keys():
+                        reads_dict[key] = values
+                    else:
+                        reads_dict[key] = [reads_dict[key][0] + values[0], values[1]]
+
+            ## remove duplicates
+            samples_taxa = [[key]+values for key,values in reads_dict.items() if values[0] != 0]
+
+            ## if PA data is required: Convert to 1/0
+            if presence_absence == True:
+                samples_taxa = [[i[0], 1, i[2]] for i in samples_taxa]
+
+            ## calculate the overall number of reads/specimens. This is required for later relative abundance calculation
+            sum_measurement = sum([i[1] for i in samples_taxa])
+
+            ## loop through all taxa
+            for taxon in samples_taxa:
+                ## if the taxon (assigned to the OTU) is present in the sample and present on the OTL, continue
+                ## add all relevant information to list (for df)
+                probe = sample
+                taxon_id = taxon[2]
+                taxonname = taxon[0]
+                form = "o.A."
+                messwert = taxon[1] / sum_measurement * 100
+                einheit = "%"
+                cf = ""
+                messwerte_list.append([messstelle, probe, taxon_id, taxonname, form, messwert, einheit, cf])
+
+        phylib_df_1 = pd.DataFrame(messtellen_list, columns=["Messstelle", "Ökoregion", "Makrophytenverödung", "Begründung", "Helophytendominanz", "Diatomeentyp", "Phytobenthostyp", "Makrophytentyp", "WRRL-Typ", "Gesamtdeckungsgrad"])
+        phylib_df_2 = pd.DataFrame(messwerte_list, columns=["Messstelle", "Probe", "Taxon", "Taxonname", "Form", "Messwert", "Einheit", "cf"])
+
+        if presence_absence == False:
+            phylib_directory = Path(str(path_to_outdirs) + "/" + "Phylib" + "/" + TaXon_table_xlsx.stem)
+            phylib_xlsx = Path(str(phylib_directory) + "_phylib_ABUNDANCE.xlsx")
+            writer = pd.ExcelWriter(phylib_xlsx, engine='xlsxwriter')
+        else:
+            phylib_directory = Path(str(path_to_outdirs) + "/" + "Phylib" + "/" + TaXon_table_xlsx.stem)
+            phylib_xlsx = Path(str(phylib_directory) + "_phylib_PA.xlsx")
+            writer = pd.ExcelWriter(phylib_xlsx, engine='xlsxwriter')
+        phylib_df_1.to_excel(writer, sheet_name='Messstelle', index=False)
+        phylib_df_2.to_excel(writer, sheet_name='Messwerte', index=False)
+        writer.save()
+
+        ################################################################################################################
+        ## create some plots and provide statistics
+        unique_original_taxa = list(k for k, _ in itertools.groupby(reordered_metadata_df[['Phylum', 'Class', 'Order', 'Family', 'Genus', 'Species']].values.tolist()))
+        len(unique_original_taxa)
+
+        unique_OTL_taxa = [i for i in set(reordered_metadata_df['Taxon (Phylib)'].values.tolist()) if i != '']
+        len(unique_OTL_taxa)
+
+        phylib_conversion_loss = {}
+        for taxon in unique_OTL_taxa:
+            all_taxa = reordered_metadata_df[reordered_metadata_df['Taxon (Phylib)'].str.contains(taxon)][['Phylum', 'Class', 'Order', 'Family', 'Genus', 'Species']].values.tolist()
+            unique_taxa = set([''.join(i) for i in all_taxa])
+            phylib_conversion_loss[taxon] = len(unique_taxa)
+
+        perlodes_conversion_loss = {k: v for k, v in sorted(phylib_conversion_loss.items(), key=lambda item: item[1])}
+
+        fig = go.Figure()
+        x_values = [i[:19] for i in list(perlodes_conversion_loss.keys())[-30:][::-1]] ## [:20] to cut names off
+        y_values = list(perlodes_conversion_loss.values())[-30:][::-1]
+        fig.add_trace(go.Bar(x=x_values, y=y_values, marker_color='blue'))
+        fig.update_yaxes(title='# taxa')
+        fig.update_layout(title='', showlegend=False, font_size=14, width=width_value, height=height_value, template=template)
+        phylib_plot = Path(str(phylib_directory) + "_phylib.pdf")
+        fig.write_image(phylib_plot)
+        phylib_plot = Path(str(phylib_directory) + "_phylib.html")
+        fig.write_html(phylib_plot)
+
+def calculate_diathor_index():
+    # Tables & Samples
+    table_display_name = st.session_state['table_display_name']
+    name = table_display_name.stem
+    df_taxon_table = st.session_state['df_taxon_table'].copy()
+    df_metadata_table = st.session_state['df_metadata_table'].copy()
+    df_samples = st.session_state['df_samples']
+
+    # Variables
+    diathor_measure = st.session_state['diathor_measure']
+
+    # collect species
+    # Remove empty species once
+    df = df_taxon_table[df_taxon_table['Species'] != ''].copy()
+
+    # Precompute total reads per sample (only once!)
+    total_reads = df[df_samples].sum()
+
+    # Aggregate reads per species
+    grouped = df.groupby('Species')[df_samples].sum()
+
+    if diathor_measure == 'Presence/Absence':
+        result = (grouped > 0).astype(int)
+
+    elif diathor_measure == 'Rel. Reads':
+        result = grouped.div(total_reads, axis=1) * 100
+
+    else:  # hash count
+        result = (
+            df.groupby('Species')[df_samples]
+            .apply(lambda x: (x != 0).sum())
+        )
+
+    # Sort species
+    result = result.sort_index()
+
+    # Add index column like before
+    result.insert(0, 'species', result.index)
+
+    # Reset index for clean df
+    diathor_df = result.reset_index(drop=True)
+
+    # drop empty samples
+    sample_sums = diathor_df[df_samples].sum()
+    samples_to_keep = sample_sums[sample_sums != 0].index.tolist()
+    diathor_df = diathor_df[['species'] + samples_to_keep]
+
+    # write the filtered list to a dataframe
+    table_name = f"{diathor_measure.replace('/', '_').replace(' ', '')}"
+    diathor_csv = export_table("Diathor", table_name, diathor_df, "csv")
+    st.success(f'Wrote Diathor input file.')
+
+    ## Calculate Diathor
+    st.info('Diathor output progress is printed to the terminal.')
+    output_folder = diathor_csv.parent.joinpath(diathor_csv.stem)
+    os.makedirs(output_folder, exist_ok=True)
+    output_xlsx = output_folder.joinpath(str(diathor_csv.name).replace('.csv', '.xlsx'))
+    log_txt = Path(str(output_xlsx).replace('.xlsx', '.log'))
+    f = open(log_txt, 'w')
+    path_to_ttt = Path(__file__).resolve().parent
+    script_path = path_to_ttt / 'Rscripts' / 'diathor.R'
+    subprocess.call(['Rscript', script_path, '-i', diathor_csv, '-o', output_xlsx], stderr=f)
+    f.close()
+    st.success(f'Finished Diathor calculations.')
+
+def calculate_efi_index():
+
+    # Tables & Samples
+    table_display_name = st.session_state['table_display_name']
+    name = table_display_name.stem
+    df_taxon_table = st.session_state['df_taxon_table'].copy()
+    df_metadata_table = st.session_state['df_metadata_table'].copy()
+
+    # Variables
+    efi_placeholder = st.session_state['efi_placeholder']
+    efi_measure = st.session_state['efi_measure']
+    taxon_table_taxonomy = list(st.session_state['tax_level_plurals'].keys())
+
+    # Check if all required columns are present in the table:
+    efi_columns = {
+        "EFI_Day": 1,
+        "EFI_Month": 1,
+        "EFI_Year": 2026,
+        "EFI_Longitude": 39.664704931322646,
+        "EFI_Latitude": -5.939361568912182,
+        "EFI_Actual.river.slope": 1.1,
+        "EFI_Temp.jul": 20,
+        "EFI_Temp.jan": 10,
+        "EFI_Floodplain.site": "No",
+        "EFI_Water.source.type": "Pluvial",
+        "EFI_Geomorph.river.type": "Meand regular",
+        "EFI_Distance.from.source": 58,
+        "EFI_Area.ctch": 450,
+        "EFI_Natural.sediment": "Gravel/Pebble/Cobble",
+        "EFI_Ecoreg": "Central highlands",
+        "EFI_Eft.type": "T.15",
+        "EFI_Fished.area": 500,
+        "EFI_Method": "Wading"
+    }
+    available_metadata = df_metadata_table.columns.tolist()
+    if not all(col in available_metadata for col in efi_columns.keys()):
+        st.warning('Could not find all required EFI columns in the Metadata Table.')
+        for col, values in efi_columns.items():
+            if efi_placeholder == 'Yes':
+                df_metadata_table[col] = values
+            else:
+                df_metadata_table[col] = ''
+        export_taxon_table(table_display_name, df_taxon_table, df_metadata_table, '')
+        st.info('You table was updated - please fill out and reload you Taxon Table.')
+        open_file(table_display_name)
+        return
+
+    df_samples = st.session_state['df_samples'].copy()
+    df_metadata_table_efi = df_metadata_table[['Samples'] + list(efi_columns.keys())]
+
+    # Filter samples
+    samples = [sample for sample in df_samples if '' not in df_metadata_table_efi[df_metadata_table_efi['Samples'] == sample].values.tolist()[0]]
+
+    if len(samples) == 0:
+        st.warning('Please fill out the required metadata for at least one sample!')
+        return
+
+    # efi_measure = 'Diversity'
+    # collect species
+    i = 1
+    efi_df_values = []
+    for sample in df_samples:
+        if efi_measure == 'Presence/Absence' or efi_measure == 'Rel. Reads':
+            taxon_dict = {}
+            total_reads = df_taxon_table[sample].sum()
+            for OTU in df_taxon_table[taxon_table_taxonomy + [sample]].values.tolist():
+                taxon = [item for item in OTU[0:7] if item != ''][-1]
+                if taxon not in taxon_dict.keys():
+                    n_reads = OTU[-1]
+                    taxon_dict[taxon] = n_reads
+                else:
+                    n_reads = OTU[-1]
+                    taxon_dict[taxon] = taxon_dict[taxon] + n_reads
+        else:
+            taxa = [i for i in df_taxon_table[df_taxon_table[sample] != 0]['Species'].values.tolist() if i != '']
+            taxon_dict = {i: taxa.count(i) for i in set(taxa)}
+
+        efi_sample_metadata = df_metadata_table_efi[df_metadata_table_efi['Samples'] == sample].values.tolist()
+        for taxon, reads in taxon_dict.items():
+            if reads != 0:
+                if efi_measure == 'Presence/Absence':
+                    total_number_run1 = 1
+                    number_length_below_150 = 1
+                    number_length_above_150 = 0
+                elif efi_measure == 'Rel. Reads':
+                    total_number_run1 = round(reads / total_reads * 100, 3)
+                    number_length_below_150 = total_number_run1
+                    number_length_above_150 = 0
+                else:
+                    total_number_run1 = reads
+                    number_length_below_150 = reads
+                    number_length_above_150 = 0
+                species_values = efi_sample_metadata[0] + [0, taxon, total_number_run1, number_length_below_150, number_length_above_150, 'abc', i, taxon]
+                efi_df_values.append(species_values)
+                i +=1
+
+    # construct EFI dataframe
+    efi_df = pd.DataFrame(efi_df_values, columns=['Sample.code'] + [i.replace('EFI_', '') for i in list(efi_columns.keys())] + ['Medit', 'Species', 'Total.number.run1', 'Number.length.below.150', 'Number.length.over.150', 'Sampling.location', 'code', 'species'])
+
+    # add dummy values
+    # other EFI will crash in some cases...
+    path_to_ttt = Path(__file__).resolve().parent
+    efi_table = path_to_ttt / 'WFD_conversion' / 'efi_table.xlsx'
+    efi_dummy_df = pd.read_excel(efi_table, sheet_name='Sheet3').fillna('')
+    efi_dummy_df = efi_dummy_df[efi_df.columns.tolist()]
+    efi_df = pd.concat([efi_df, efi_dummy_df], ignore_index=True)
+    efi_df['code'] = [i for i in range(1, len(efi_df)+1)]
+
+    # write the filtered list to a dataframe
+    table_name = f"{efi_measure.replace('/', '_').replace(' ', '')}"
+    efi_xlsx = export_table("EFI", table_name, efi_df, "xlsx")
+    st.success(f'Wrote EFI input file.')
+
+    ####################################################################################################################
+    ## Calculate EFI
+    st.info('EFI output progress is printed to the terminal.')
+    active_project_path = st.session_state['active_project_path']
+    os.makedirs(active_project_path / "EFI", exist_ok=True)
+    efi_results_xlsx = active_project_path / "EFI" / f"{name}_{table_name}_results.xlsx"
+    efi_log = active_project_path / "EFI" / f"{name}_{table_name}.log"
+    f = open(efi_log, 'w')
+    script_path = path_to_ttt / 'Rscripts' / 'EFI.R'
+    efi_directory = path_to_ttt / 'Rscripts'
+    subprocess.call([
+        'Rscript',
+        script_path,
+        '-d', efi_directory,
+        '-i', efi_xlsx,
+        '-o', efi_results_xlsx
+    ], stderr=f)
+    f.close()
+    st.success(f'Finished EFI calculations!')
 
 ########################################################################################################################
 # side bar
@@ -1493,7 +3530,7 @@ def TTT_variables():
                              "EFI", "Diathor", "Phylib", "Time_series", "Basic_stats", "Fasta", "Import",
                              "Rarefaction_curves"]
 
-    available_templates_list = ['seaborn', 'ggplot2', 'simple_white', 'plotly', 'plotly_dark', 'presentation', 'plotly_white']
+    available_templates_list = ['TaxonTableTools', 'seaborn', 'ggplot2', 'simple_white', 'plotly', 'plotly_dark', 'presentation', 'plotly_white']
 
     available_clustering_units = ['OTUs', 'zOTUs', 'ESVs', 'ASVs']
 
@@ -1541,6 +3578,8 @@ def TTT_variables():
     "Pastel":px.colors.qualitative.Pastel, "Prism":px.colors.qualitative.Prism, "Safe":px.colors.qualitative.Safe,
     "Vivid":px.colors.qualitative.Vivid}
 
+    st.session_state['available_colorsequences'] = available_colorsequences
+
     available_colorscales = px.colors.named_colorscales()
 
     available_taxonomic_levels_list= ['Phylum', 'Class', 'Order', 'Family', 'Genus', 'Species', 'Hash']
@@ -1566,6 +3605,7 @@ if user_preferences_xlsx.exists():
     TTT_fontsize = user_data_df[user_data_df['Variable'] == 'TTT_fontsize']['Value'].values.tolist()[0]
     TTT_hash = user_data_df[user_data_df['Variable'] == 'TTT_hash']['Value'].values.tolist()[0]
     TTT_scattersize = user_data_df[user_data_df['Variable'] == 'TTT_scattersize']['Value'].values.tolist()[0]
+    TTT_linewidth = user_data_df[user_data_df['Variable'] == 'TTT_linewidth']['Value'].values.tolist()[0]
     TTT_jitter = user_data_df[user_data_df['Variable'] == 'TTT_jitter']['Value'].values.tolist()[0]
     TTT_color1 = user_data_df[user_data_df['Variable'] == 'TTT_color1']['Value'].values.tolist()[0]
     TTT_color2 = user_data_df[user_data_df['Variable'] == 'TTT_color2']['Value'].values.tolist()[0]
@@ -1576,9 +3616,6 @@ if user_preferences_xlsx.exists():
 ########################################################################################################################
 
 with st.sidebar:
-    #####################################
-    st.write(""" # Projects """)
-
     # Get user input
     #####################################
     st.write(""" ## Working directory """)
@@ -1634,7 +3671,7 @@ with st.sidebar:
         # Select TTT project
         active_project_path = path_to_projects / st.session_state['active_project']
         st.session_state['active_project_path'] = active_project_path
-        if st.button('Open Active Project', width='stretch'):
+        if st.button('🗂️ Open Active Project', width='stretch'):
             open_folder(active_project_path)
 
         # Select Table
@@ -1658,7 +3695,7 @@ with st.sidebar:
 
             # Update session state
             st.session_state['taxon_table_xlsx'] = Path(active_taxontable_file)
-            if st.button('Load Table', width='stretch'):
+            if st.button('📥 Load Table', type='primary', width='stretch'):
                 # Update table name for display
                 st.session_state['table_display_name'] = Path(active_taxontable_file)
                 # Taxon Table -> df_taxon_table
@@ -1676,7 +3713,9 @@ with st.sidebar:
                 st.session_state['df_metadata_table'] = pd.read_excel(active_taxontable_file, sheet_name='Metadata Table').fillna('')
                 # Samples -> df_samples
                 seq_loc = st.session_state['df_taxon_table'].columns.tolist().index('Seq')
-                st.session_state['df_samples'] = st.session_state['df_taxon_table'].columns.tolist()[seq_loc+1:]
+                taxontable_samples = st.session_state['df_taxon_table'].columns.tolist()[seq_loc+1:]
+                metadata_samples = st.session_state['df_metadata_table']['Samples'].values.tolist()
+                st.session_state['df_samples'] = metadata_samples
                 species_loc = st.session_state['df_taxon_table'].columns.tolist().index('Species')
                 # Traits -> df_traits_table
                 st.session_state['df_traits_table'] = st.session_state['df_taxon_table'].columns.tolist()[species_loc+1:seq_loc]
@@ -1687,7 +3726,7 @@ with st.sidebar:
 
             if 'df_taxon_table' in st.session_state and 'table_display_name' in st.session_state:
                 st.success(f'Active table: {st.session_state["table_display_name"].stem}')
-                if st.button('Open Active Table', width='stretch'):
+                if st.button('📄 Open Active Table', width='stretch'):
                     open_file(st.session_state["table_display_name"])
             else:
                 st.warning(f'No active table.')
@@ -1711,8 +3750,24 @@ with st.sidebar:
             st.session_state['TTT_hash'] = st.sidebar.selectbox('Clustering unit (hash description)', available_clustering_units, index=available_clustering_units.index(TTT_hash))
             # SCATTER SIZE
             st.session_state['TTT_scattersize'] = st.sidebar.number_input('Scatter size', 0, 40, TTT_scattersize)
-            # SCATTER SIZE
+            # LINE WIDTH
+            st.session_state['TTT_linewidth'] = st.sidebar.number_input('Line width', 0, 40, TTT_linewidth)
+            # JITTER
             st.session_state['TTT_jitter'] = st.sidebar.number_input('Jitter', 0.0, 1.0, 0.3)
+
+            TTT_config = {
+                "displaylogo": False,  # remove plotly logo
+                "toImageButtonOptions": {
+                    "format": "svg",  # png, svg, jpeg, webp
+                    "filename": "my_plot",
+                    "height": st.session_state['TTT_height'],
+                    "width": st.session_state['TTT_width']
+                },
+                "modeBarButtonsToRemove": [
+                    "lasso2d",
+                    "select2d"
+                ]}
+            st.session_state['TTT_config'] = TTT_config
 
             ################################################################################################################
             st.sidebar.write(""" ### Colors """)
@@ -1738,6 +3793,7 @@ with st.sidebar:
                 'TTT_fontsize',
                 'TTT_hash',
                 'TTT_scattersize',
+                'TTT_linewidth',
                 'TTT_jitter',
                 'TTT_color1',
                 'TTT_color2',
@@ -1751,20 +3807,23 @@ with st.sidebar:
                 "Value": [st.session_state[key] for key in settings_keys]
             })
 
-            if st.button("🔄 Save Settings", width='stretch'):
+            if st.button("💾 Save Settings", width='stretch'):
                 settings_df.to_excel(user_preferences_xlsx, index=False)
                 st.success('Settings were saved!')
 
-
 ########################################################################################################################
-st.markdown("## 🧬 Create Taxon Table")
 if 'df_taxon_table' not in st.session_state or 'table_display_name' not in st.session_state:
     expanded=True
 else:
     expanded=False
 
+st.markdown("## 🐙 TTTutorial")
+with st.expander(expanded=expanded, label='See more'):
+    TTTutorial()
+
 if path_to_projects.exists():
 
+    st.markdown("## 🧬 Create Taxon Table")
     with st.expander(expanded=expanded, label='See more'):
         # Collect import files
         import_folder = active_project_path / 'Import'
@@ -1797,39 +3856,85 @@ if 'df_taxon_table' in st.session_state and 'table_display_name' in st.session_s
     ########################################################################################################################
     st.markdown("## 🖥️ Basic Stats")
     with st.expander(expanded=True, label='See more'):
+        col1, col2 = st.columns(2)
+        with col1:
             basic_stats_reads()
+        with col2:
             basic_stats_OTUs()
+        col1, col2 = st.columns(2)
+        with col1:
+            tax_res_plot()
+        with col2:
             top_n_taxa_plot()
+        try:
+            st.write('Table 1: Dataset statistics')
+            collect_sample_stats()
+        except:
+            st.warning('Unable to calculate dataset statistics!')
 
     ########################################################################################################################
     st.markdown("## 🛠️ Table Processing")
     with st.expander(expanded=False, label='See more'):
 
         st.write('### Replicate Merging')
-        # --- Derive sample structure ---
-        df_samples = st.session_state['df_samples']
-        hash_label = st.session_state['TTT_hash']
-        suffixes = sorted({i.split('_')[-1] for i in df_samples})
-        st.session_state['suffixes'] = suffixes
-        unique_samples = sorted({'_'.join(i.split('_')[:-1]) for i in df_samples})
-        st.session_state['unique_samples'] = unique_samples
-        expected_samples = [f"{s}_{suf}" for suf in suffixes for s in unique_samples]
-        n_suffixes = len(suffixes)
-        cutoff_options = list(range(1, n_suffixes + 1))[::-1]
-        # --- Overview Metrics ---
-        col1, col2, col3, col4, col5 = st.columns(5)
-        col1.metric("Total Samples", len(df_samples))
-        col2.metric("Unique Samples", len(unique_samples))
-        col3.metric("Replicate Suffixes", ", ".join(suffixes))
-        # --- Cutoff Selection ---
-        with col4:
+         # --- Overview Metrics ---
+        col1, col2, col3, = st.columns(3)
+        with col1:
+            suffix_detection = st.selectbox(label='Replicate Suffixes', options=['Auto-detect', 'Custom'], key='suffix_detection')
+            if suffix_detection == 'Auto-detect':
+                # --- Derive sample structure ---
+                df_samples = st.session_state['df_samples']
+                hash_label = st.session_state['TTT_hash']
+                suffixes = sorted({i.split('_')[-1] for i in df_samples})
+                unique_samples = sorted({'_'.join(i.split('_')[:-1]) for i in df_samples})
+                st.session_state['suffixes'] = suffixes
+                st.session_state['unique_samples'] = unique_samples
+                expected_samples = [f"{s}_{suf}" for suf in suffixes for s in unique_samples]
+                missing_samples = [sample for sample in expected_samples if sample not in df_samples]
+                n_suffixes = len(suffixes)
+                cutoff_options = list(range(1, n_suffixes + 1))[::-1]
+                # --- Compact UI ---
+                st.write(
+                    f"""
+                    **Detected suffixes:** {', '.join(suffixes)}  
+                    **Unique samples:** {len(unique_samples)}  
+                    **Expected replicates:** {len(expected_samples)}  
+                    **Present replicates:** {len(df_samples)}  
+                    **Missing samples:** {len(missing_samples)}  
+                    """)
+            else:
+                # --- Derive sample structure ---
+                df_samples = st.session_state['df_samples']
+                hash_label = st.session_state['TTT_hash']
+                suffixes_input = st.text_input(label='Enter suffixes:', value='A,B', key='suffixes_input')
+                suffixes = suffixes_input.split(',')
+                st.session_state['suffixes'] = suffixes
+                unique_samples = sorted({'_'.join(i.split('_')[:-1]) for i in df_samples})
+                st.session_state['unique_samples'] = unique_samples
+                expected_samples = [f"{s}_{suf}" for suf in suffixes for s in unique_samples]
+                missing_samples = [sample for sample in expected_samples if sample not in df_samples]
+                n_suffixes = len(suffixes)
+                cutoff_options = list(range(1, n_suffixes + 1))[::-1]
+                # --- Compact UI ---
+                st.write(
+                    f"""
+                    **Detected suffixes:** {', '.join(suffixes)}  
+                    **Unique samples:** {len(unique_samples)}  
+                    **Expected replicates:** {len(expected_samples)}  
+                    **Present replicates:** {len(df_samples)}  
+                    **Missing samples:** {len(missing_samples)}  
+                    """)
+        with col2:
+            pass
+        with col2:
             cutoff_value = st.selectbox(label=f"{hash_label} must be present in at least:",options=cutoff_options, format_func=lambda x: f"{x} replicate(s)", key='cutoff_value')
-        with col5:
+            if cutoff_value == 1:
+                st.info(f"All {hash_label} will be kept after replicate merging.")
+            else:
+                st.warning(
+                    f"Only {hash_label} present in "f"{cutoff_value}/{n_suffixes} replicates "f"will be kept after replicate merging.")
+        with col3:
             missing_replicates_handling = st.selectbox(label=f"Handle samples which miss replicates:",options=['Keep', 'Remove'], key='missing_replicates_handling')
-        if cutoff_value == 1:
-            st.info(f"All {hash_label} will be kept after replicate merging.")
-        else:
-            st.warning(f"Only {hash_label} present in "f"{cutoff_value}/{n_suffixes} replicates "f"will be kept after replicate merging.")
         # --- Action Button ---
         if st.button("🔄 Merge Replicates", use_container_width=True):
             replicate_merging()
@@ -1984,6 +4089,20 @@ if 'df_taxon_table' in st.session_state and 'table_display_name' in st.session_s
             simplify_table()
         st.divider()
 
+        st.write('### Combine Taxon Tables')
+        # --- Initialize structure ---
+        col1, col2 = st.columns([4, 6])
+        with col1:
+            df2_taxon_table_file = st.file_uploader(label='Drag and drop your trait table here:', key='df2_taxon_table_file')
+        with col2:
+            table_merge_suffix = st.text_input(label='Please Enter a Table Suffix:', value='combined', key='table_merge_suffix')
+            if df2_taxon_table_file == None:
+                st.write('')
+                st.info('Please provide a Taxon Table to continue!')
+        # --- Action Button ---
+        if st.button("🔄 Merge Selected Taxon Tables", use_container_width=True):
+            merge_taxon_tables()
+        st.divider()
 
         st.write('### Add Traits From File')
         # --- Initialize structure ---
@@ -2006,7 +4125,8 @@ if 'df_taxon_table' in st.session_state and 'table_display_name' in st.session_s
                 st.info(f'Selected taxon: {st.session_state["trait_import_taxon"]}')
         # --- Action Button ---
         if st.button("🔄 Add Traits From File", use_container_width=True):
-            add_traits_from_file()
+            if trait_import_table != None:
+                add_traits_from_file()
         st.divider()
 
 
@@ -2078,31 +4198,109 @@ if 'df_taxon_table' in st.session_state and 'table_display_name' in st.session_s
             readdist_mode = st.selectbox(label='Select Display Mode:', options=['Relative Reads', 'Absolute Reads'], key='readdist_mode')
             readdist_nan = st.selectbox(label='Handle Missing Taxonomy:', options=['Exclude', 'Include'], key='readdist_nan')
         with col3:
-            readdist_color = st.selectbox(label='Select Color Mode:', options=['Color scale'], key='readdist_color')
+            readdist_color = st.selectbox(label='Select Color Mode:', options=['Color Sequence', 'Color Scale'], key='readdist_color')
         # --- Action Button ---
         if st.button(f"🔄 Generate Read Distribution Diagram", use_container_width=True):
             readdist_diagram()
+        st.divider()
+
+        st.write(f'### Read-based Rarefaction')
+        # --- Initialize structure ---
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            read_rarefaction_reps = st.number_input(label='Number of Repetitions:', min_value=10, max_value=5000, value=10, key='read_rarefaction_reps')
+            read_rarefaction_splits = st.number_input(label='Number of Sampling Points (X-Axis):', min_value=10, max_value=100, value=10, key='read_rarefaction_splits')
+        with col2:
+            read_rarefaction_taxon = st.selectbox(label='Select Taxonomic Level:', options=st.session_state['taxa_cols2'], index=6, key='read_rarefaction_taxon')
+            read_rarefaction_display = st.selectbox(label='Select Y-Axis Scaling:', options=['Absolute', 'Relative'], key='read_rarefaction_display')
+        with col3:
+            read_rarefaction_color = st.selectbox(label='Select Color Mode:', options=['Color Scale', 'Color Sequence', 'Single Color'], index=2, key='read_rarefaction_color')
+        st.info('Please note that read-based rarefaction analyses can take very long, especially with high sequencing depths!')
+        # --- Action Button ---
+        if st.button(f"🔄 Calculate Rarefaction Curves", use_container_width=True):
+            read_rarefaction()
+        st.divider()
+
+        st.write(f'### Read/{TTT_hash[:-1]} Auto-correlation')
+        # --- Initialize structure ---
+        st.info(f'Correlate the number of Reads and {TTT_hash} per sample.')
+        # --- Action Button ---
+        if st.button(f"🔄 Calculate Read/{TTT_hash[:-1]} Auto-correlation", use_container_width=True):
+            read_hash_autocorrelation()
         st.divider()
 
     ########################################################################################################################
     st.markdown("## 🌱 Alpha Diversity")
     with st.expander(expanded=False, label='See more'):
 
-        st.write('### Taxon Richness Diagram')
+        st.write('### Alpha Diversity Diagram')
         # --- Initialize structure ---
         col1, col2, col3 = st.columns(3)
         with col1:
-            richness_taxon = st.selectbox(label='Select Taxonomic Level:', options=st.session_state['taxa_cols2'], index=6, key='richness_taxon')
-            richness_level = st.selectbox(label='Select Sample Level:', options=['Samples'] + available_metadata, key='richness_level')
+            alphadiv_taxon = st.selectbox(label='Alpha Diversity Measure:', options=st.session_state['taxa_cols2'], index=6, key='alphadiv_taxon')
+            alphadiv_measure = st.selectbox(label='Alpha Diversity Calculation:', options=['Richness', 'Heip Evenness', 'Pielou Evenness', 'Shannon Diversity'], key='alphadiv_measure', help=help_alphadiv)
+            if alphadiv_measure != 'Richness' and alphadiv_taxon == 'Hash':
+                alphadiv_mode = st.selectbox(label='Select Quantification:', options=['Rel. Reads'], key='alphadiv_mode')
+            elif alphadiv_measure != 'Richness' and alphadiv_taxon != 'Hash':
+                alphadiv_mode = st.selectbox(label='Select Quantification:', options=[f'{TTT_hash[:-1]} Richness', 'Rel. Reads'], key='alphadiv_mode')
+            else:
+                alphadiv_mode = st.selectbox(label='Select Quantification:', options=['None'], key='alphadiv_mode')
         with col2:
-            richness_mode = st.selectbox(label='Select Display Mode:', options=['Bar', 'Box', 'Violin'], key='richness_mode')
-            richness_boxpoints = st.selectbox(label='Boxpoints Display:', options=['All', 'None'], key='richness_boxpoints')
+            alphadiv_layout = st.selectbox(label='Select Display Mode:', options=['Bar', 'Scatter', 'Box', 'Violin'], key='alphadiv_layout')
+            if alphadiv_layout == 'Bar' or alphadiv_layout == 'Scatter':
+                alphadiv_level = st.selectbox(label='Select Sample Level:', options=['Samples'], key='alphadiv_level')
+            else:
+                alphadiv_level = st.selectbox(label='Select Sample Level:', options=available_metadata, key='alphadiv_level')
+            if alphadiv_measure != 'Richness' and alphadiv_measure != 'Shannon Diversity':
+                alphadiv_interpration = st.selectbox(label='Add Interpretation Lines:', options=['Yes', 'No'], key='alphadiv_interpration')
+            else:
+                st.session_state['alphadiv_interpration'] = 'No'
         with col3:
-            richness_nan = st.selectbox(label='Handle Missing Taxonomy:', options=['Exclude', 'Include'], key='richness_nan')
-            richness_color = st.selectbox(label='Select Color Mode:', options=['Color scale', 'Single Color'], key='richness_color')
+            alphadiv_color = st.selectbox(label='Select Color Mode:', options=['Color Scale', 'Color Sequence', 'Single Color'], key='alphadiv_color')
+            if alphadiv_layout == 'Box' or alphadiv_layout == 'Violin':
+                alphadiv_boxpoints = st.selectbox(label='Boxpoints Display:', options=['All', 'False'], key='alphadiv_boxpoints')
+            else:
+                st.session_state['alphadiv_boxpoints'] = 'NAN'
         # --- Action Button ---
-        if st.button(f"🔄 Generate {richness_taxon} Richness Diagram", use_container_width=True):
-            alpha_richness_diagram()
+        if st.button(f"🔄 Generate {alphadiv_taxon} {alphadiv_measure} Diagram", use_container_width=True):
+            alphadiv_diagram()
+        st.divider()
+
+        st.write('### Circle Diagram')
+        # --- Initialize structure ---
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            pycircos_taxon0 = st.selectbox(label='Select Outer Groups:', options=st.session_state['taxa_cols2'][:-3], index=0, key='pycircos_taxon0')
+            available_taxon1 = st.session_state['taxa_cols2'][st.session_state['taxa_cols2'].index(pycircos_taxon0)+1:]
+            pycircos_taxon1 = st.selectbox(label='Select Inner Groups:', options=available_taxon1, index=0, key='pycircos_taxon1')
+            available_taxon2 = st.session_state['taxa_cols2'][st.session_state['taxa_cols2'].index(pycircos_taxon1)+1:]
+            pycircos_taxon2 = st.selectbox(label='Alpha Diversity Measure:', options=available_taxon2, index=available_taxon2.index('Species'), key='pycircos_taxon2')
+        with col2:
+            pycircos_groups = [i for i in st.session_state['df_taxon_table'][pycircos_taxon0].unique().tolist() if i != '']
+            st.session_state['pycircos_groups'] = pycircos_groups
+            n_groups = len(pycircos_groups)
+            pycircos_cmaps_dict = {'Green': 'Greens', 'Orange': 'Oranges', 'Yellow': 'Wistia', 'Red': 'Reds',
+                                   'Blue': 'Blues', 'Lightgrey': 'Greys'}
+            if n_groups <= 6:
+                st.session_state['pycircos_colors'] = 'custom'
+                st.session_state['pycircos_cmaps_dict'] = pycircos_cmaps_dict
+                cols = st.columns(2)
+                for i, group in enumerate(pycircos_groups):
+                    with cols[i % 2]:
+                        st.selectbox(
+                            label=group,
+                            options=list(pycircos_cmaps_dict.keys()),
+                            index=i,
+                            key=f'pycircos_colors_{group}')
+            else:
+                pycircos_colors = st.selectbox(label='Select Color Mode:', options=list(pycircos_cmaps_dict.keys()), key='pycircos_colors')
+        with col3:
+            pycircos_nan = st.selectbox(label='Handle Missing Taxonomy:', options=['Exclude', 'Include'], key='pycircos_nan')
+            pycircos_inner_labels = st.selectbox(label='Inner Labels:', options=['Show', 'Hide'], key='pycircos_inner_labels')
+        # --- Action Button ---
+        if st.button(f"🔄 Generate Pycircos Diagram", use_container_width=True):
+            pycircos_plot()
         st.divider()
 
     ########################################################################################################################
@@ -2126,20 +4324,200 @@ if 'df_taxon_table' in st.session_state and 'table_display_name' in st.session_s
             beta_diversity_matrix()
         st.divider()
 
+        st.write('### Principle Coordinate (PCoA) Analysis')
+        # --- Initialize structure ---
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            pcoa_taxon = st.selectbox(label='Select Taxonomic Level:', options=st.session_state['taxa_cols2'], index=6, key='pcoa_taxon')
+            pcoa_mode = st.selectbox(label='Select Diversity Calculation:', options=['Jaccard (qualitative)', 'Bray-Curtis (quantitative)'], key='pcoa_mode')
+        with col2:
+            pcoa_level = st.selectbox(label='Select Group Level:', options=['Samples'] + available_metadata, key='pcoa_level')
+            pcoa_showlabels = st.selectbox(label='Scatter Labels:', options=showlabels_options, key='pcoa_showlabels')
+        with col3:
+            pcoa_color = st.selectbox(label='Select Color Mode:', options=['Color scale', 'Color sequence', 'Single Color'], key='pcoa_color')
+            pcoa_groups = st.selectbox(label='Select Grouping Display:', options=['None', 'Outlines', 'Continous'], key='pcoa_groups')
+        # --- Action Button 1 ---
+        if st.button(f"🔄 Calculate {pcoa_mode} Dissimilarity PCoA", use_container_width=True):
+            pcoa_df, explained_variance_df, pcoa_distance_matrix_df = pcoa_calculation()
+            st.session_state['pcoa_df'] = pcoa_df
+            st.session_state['pcoa_distance_matrix_df'] = pcoa_distance_matrix_df
+            st.session_state['pcoa_explained_variance_df'] = explained_variance_df
+            st.session_state['pcoa_explained_variance_dict'] = {f'{i} ({round(j[0],2)}%)':i for i,j in zip(explained_variance_df.index.tolist(), explained_variance_df.values.tolist())}
+        # --- Action Button 2 ---
+        if 'pcoa_explained_variance_dict' in st.session_state and 'pcoa_df' in st.session_state:
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.selectbox(label='Select X-Axis:', options=st.session_state['pcoa_explained_variance_dict'].keys(), index=0, key='pcoa_x')
+            with col2:
+                st.selectbox(label='Select Y-Axis:', options=st.session_state['pcoa_explained_variance_dict'].keys(), index=1, key='pcoa_y')
+            with col3:
+                st.selectbox(label='Select Z-Axis:', options=['None'] + list(st.session_state['pcoa_explained_variance_dict'].keys()), index=0, key='pcoa_z')
+            if st.button(f"🔄 Plot PCoA", use_container_width=True):
+                pcoa_plot()
+        else:
+            st.warning('Please calculate the PCoA first!')
+        st.divider()
+
+        st.write('### Non-metric Multidimensional Scaling (NMDS) Analysis')
+        # --- Initialize structure ---
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            nmds_taxon = st.selectbox(label='Select Taxonomic Level:', options=st.session_state['taxa_cols2'], index=6, key='nmds_taxon')
+            nmds_mode = st.selectbox(label='Select Diversity Calculation:', options=['Jaccard (qualitative)', 'Bray-Curtis (quantitative)'], key='nmds_mode')
+        with col2:
+            nmds_level = st.selectbox(label='Select Group Level:', options=['Samples'] + available_metadata, key='nmds_level')
+            nmds_showlabels = st.selectbox(label='Scatter Labels:', options=showlabels_options, key='nmds_showlabels')
+        with col3:
+            nmds_color = st.selectbox(label='Select Color Mode:', options=['Color scale', 'Color sequence', 'Single Color'], key='nmds_color')
+            nmds_groups = st.selectbox(label='Select Grouping Display:', options=['None', 'Outlines', 'Continous'], key='nmds_groups')
+            nmds_axes = st.selectbox(label='Select NMDS Dimensions:', options=[2,3], index=0, key='nmds_axes')
+        # --- Action Button 1 ---
+        if st.button(f"🔄 Calculate {nmds_mode} Dissimilarity NMDS", use_container_width=True):
+            nmds_df, nmds_stress = nmds_calculation()
+            st.session_state['nmds_df'] = nmds_df
+            st.session_state['nmds_stress'] = nmds_stress
+        # --- Action Button 2 ---
+        if 'nmds_stress' in st.session_state:
+            st.info(f'NMDS stress: {st.session_state["nmds_stress"]:.2}')
+            if st.button(f"🔄 Plot NMDS", use_container_width=True):
+                nmds_plot()
+        st.divider()
+
     ########################################################################################################################
     st.markdown("## 📆 Time Series")
     with st.expander(expanded=False, label='See more'):
-        st.info('Coming soon!')
+        st.write('### Richness Over Time')
+        # --- Initialize structure ---
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            ts_level = st.selectbox(label='Select Group Level:', options=['Samples'] + available_metadata, key='ts_level')
+            ts_taxon = st.selectbox(label='Select Taxonomic Level:', options=st.session_state['taxa_cols2'], index=6, key='ts_taxon')
+        with col2:
+            ts_ci = st.number_input('Select Confidence Intervall:', 0, 100, 98, key='ts_ci')
+        with col3:
+            ts_bootstraps = st.number_input('Select Bootstrap Repetitions:', 0, 5000, 100, key='ts_bootstraps')
+
+        st.info(f'Samples will be sorted on the X-axis according to the metadata table "Samples" column order: {",".join(df_samples[:3])} ... ')
+        # --- Action Button 1 ---
+        if st.button(f"🔄 Calculate Richness Over Time", use_container_width=True):
+            time_series_richness()
 
     ########################################################################################################################
-    st.markdown("## 🔗 API Modules")
+    st.markdown("## 🌿 GBIF Modules")
     with st.expander(expanded=False, label='See more'):
-        st.info('Coming soon!')
+        st.write('### GBIF Data')
+        st.info("Download GBIF species data and enrich the taxon table.")
+        if st.button("🔄 Add GBIF Data", use_container_width=True):
+            gbif_accession()
+        st.divider()
+
+        st.write('### GBIF Metabarcoding Data Toolkit')
+        col1, col2 = st.columns(2)
+        with col1:
+            gbif_dataset_requirements = st.checkbox(label='I have read the dataset requirements', value=False,key='gbif_dataset_requirements')
+        with col2:
+            if st.button(label='🔗 GBIF Metabarcoding Data Toolkit (Test Environment)', use_container_width=True):
+                webbrowser.open('https://mdt.gbif-test.org/dataset/new')
+
+        if gbif_dataset_requirements == False:
+            st.markdown("""
+            #### 📋 Dataset Requirements
+            Please ensure that the following conditions apply to your dataset before proceeding:
+            - ✅ **DNA metabarcoding data**  
+              The dataset originates from a DNA metabarcoding study.
+            - ✅ **Data sharing permission**  
+              You have permission to share and process the dataset.
+            - ✅ **OTU/ASV table available**  
+              The dataset contains an OTU/ASV table with associated taxonomy and sample metadata.
+            - ✅ **Sequences available**  
+              OTU/ASV sequences are available and can be included.
+            - ✅ **Read counts included**  
+              The OTU table contains the number of **sequence reads per OTU/ASV and sample**.
+            - ✅ **Essential metadata available**  
+              Metadata such as **sampling location, date, or environmental context** is provided.
+            #### 🧹 Data Cleaning Requirements
+            To ensure reliable downstream analyses, confirm the following:
+            - ⚠️ **Controls are identified**  
+              Non-sample entries (e.g., **negative controls, PCR blanks, positive controls**) are clearly identified and can be excluded, for example by removing them from the **Samples table**.
+            - ⚠️ **Contaminants are removed**  
+              Contaminant or unreliable detections (**OTUs/species/taxa**) are identified and can be excluded, for example by removing them from the **Taxonomy table**.
+            """)
+
+        if st.button("🔄 Convert Taxon Table to GBIF Upload", use_container_width=True):
+            if gbif_dataset_requirements == True:
+                gbif_upload_conversion()
+            else:
+                st.info('Please read the GBIF dataset requirements first!')
+
 
     ########################################################################################################################
     st.markdown("## 🇪🇺 Ecological Status Classes")
     with st.expander(expanded=False, label='See more'):
-        st.info('Coming soon!')
+        st.write('### European Fish Index')
+        # --- Initialize structure ---
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            efi_measure = st.selectbox(label='Select Diversity Measure:', options=['Presence/Absence', 'Rel. Reads', f'{TTT_hash[:-1]} Diversity'], key='efi_measure')
+        with col2:
+            efi_placeholder = st.selectbox(label='Add Placeholder Data:', options=['Yes', 'No'], key='efi_placeholder')
+        with col3:
+            efi_info = st.toggle(label='Learn More About the EFI', key="efi_info")
+        if efi_info == True:
+            efi_table = path_to_ttt / 'WFD_conversion' / 'efi_table.xlsx'
+            st.write('Table 1: Accepted variables for EFI calculation.')
+            st.dataframe(pd.read_excel(efi_table, sheet_name='Sheet1').fillna(''), hide_index=True)
+            st.write('Table 2: Available ecoregions for EFI calculation.')
+            st.dataframe(pd.read_excel(efi_table, sheet_name='Sheet2').fillna(''), hide_index=True)
+            efi_map = efi_table / 'WFD_conversion', 'efi_ecoregions.png'
+
+        # --- Action Button ---
+        if st.button(f"🔄 Calculate EFI", use_container_width=True):
+            calculate_efi_index()
+        st.divider()
+
+        st.write('### Diathor Index')
+        # --- Initialize structure ---
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            diathor_measure = st.selectbox(label='Select Diversity Measure:', options=['Presence/Absence', 'Rel. Reads', f'{TTT_hash[:-1]} Diversity'], key='diathor_measure')
+        with col2:
+            pass
+        with col3:
+            pass
+        # --- Action Button ---
+        if st.button(f"🔄 Calculate Diathor Index", use_container_width=True):
+            calculate_diathor_index()
+        st.divider()
+
+        st.write('### Convert To Perlodes Format')
+        # --- Initialize structure ---
+        col1, col2 = st.columns([3,6])
+        with col1:
+            perlodes_measure = st.selectbox(label='Select Diversity Measure:', options=['Presence/Absence', 'Rel. Reads', f'{TTT_hash[:-1]} Diversity'], key='perlodes_measure')
+        with col2:
+            st.write('')
+            st.write('')
+            if st.button("🔗 Perlode Online Calculation", use_container_width=True):
+                pass
+        # --- Action Button ---
+        if st.button(f"🔄 Convert To Perlodes", use_container_width=True):
+            st.info('Coming soon!')
+        st.divider()
+
+        st.write('### Convert To Phylib Format')
+        # --- Initialize structure ---
+        col1, col2 = st.columns([3,6])
+        with col1:
+            phylib_measure = st.selectbox(label='Select Diversity Measure:', options=['Presence/Absence', 'Rel. Reads', f'{TTT_hash[:-1]} Diversity'], key='phylib_measure')
+        with col2:
+            st.write('')
+            st.write('')
+            if st.button("🔗 Phylib Online Calculation", use_container_width=True):
+                pass
+        # --- Action Button ---
+        if st.button(f"🔄 Convert To Phylib", use_container_width=True):
+            st.info('Coming soon!')
+        st.divider()
 else:
     st.write('')
     st.warning('Please Load a Taxon Table to continue!')

@@ -5,7 +5,7 @@ with open("README.md", "r") as fh:
 
 setuptools.setup(
     name="taxontabletools2",
-    version="2.1.5",
+    version="2.3.0",
     author="Till-Hendrik Macher",
     author_email="macher@uni-trier.de",
     description="Taxontabletools2 - A comprehensive, platform-independent graphical user interface software to explore and visualise DNA metabarcoding data",
@@ -16,6 +16,11 @@ setuptools.setup(
     license = 'MIT',
     install_requires=[
         "streamlit",
+        "stqdm",
+        "scikit-learn",
+        "xlsxwriter",
+        "pycirclize",
+        "update_checker",
         "pandas",
         "numpy",
         "plotly",
@@ -39,7 +44,7 @@ setuptools.setup(
         "License :: OSI Approved :: MIT License",
         "Operating System :: OS Independent",
     ],
-    python_requires='>=3.12',
+    python_requires='>=3.10',
     entry_points = {
         "console_scripts" : [
             "taxontabletools2 = taxontabletools2.__main__:main",

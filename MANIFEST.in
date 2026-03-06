@@ -1,5 +1,3 @@
-recursive-include taxontabletools2/pages *.py
-include taxontabletools2/user_preferences.xlsx
 recursive-include taxontabletools2/WFD_conversion *
 recursive-include taxontabletools2/Rscripts *.R
 recursive-include taxontabletools2/Rscripts/internal *
