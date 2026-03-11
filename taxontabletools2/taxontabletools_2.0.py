@@ -41,6 +41,13 @@ from skbio.diversity.alpha import heip_e
 from skbio.diversity.alpha import pielou_e
 from skbio.diversity.alpha import shannon
 from stqdm import stqdm
+from pygbif import occurrences as occ
+import geopandas as gpd
+from shapely.geometry import Polygon, MultiPolygon
+from shapely.geometry.polygon import orient
+from itertools import product
+import shapely.wkt as wkt
+from pygbif import maps
 
 ########################################################################################################################
 ## session state cheat sheet
@@ -70,7 +77,7 @@ from stqdm import stqdm
 # TTT_colorscale
 
 if 'test' == 'pass':
-    table_display_name = Path('/Users/tillmacher/Desktop/TTT_projects/AA_test/TaXon_tables/eDNA_physalia_2026_taxon_table.xlsx')
+    table_display_name = Path('/Users/tillmacher/Desktop/TTT_projects/AA_test/TaXon_tables/River_mulde_fish_eDNA_2019_merged_NCsub_fish.xlsx')
     df_taxon_table = pd.read_excel(table_display_name).fillna('')
     seq_loc = df_taxon_table.columns.tolist().index('Seq')
     hash_loc = df_taxon_table.columns.tolist().index('Hash')
@@ -363,6 +370,14 @@ def get_colors_from_sequence(sequence_name, n):
     full_list = color_sequence * repeats
     return full_list[:n]
 
+def colors_to_metadata(df_metadata_table, metadata, colors):
+    df_metadata_table = df_metadata_table.copy()
+    groups = list(df_metadata_table[metadata].unique())
+    colors_dict = {group:color for color, group in zip(colors, groups)}
+    res = [colors_dict[sample_color] for sample_color in df_metadata_table[metadata].values.tolist()]
+    df_metadata_table['TTT_metadatacolor'] = res
+    return df_metadata_table
+
 def concatenate_by_metadata(selected_metadata):
 
     df_taxon_table = st.session_state['df_taxon_table'].copy()
@@ -408,6 +423,20 @@ def convert_r_p(r, p):
     elif p < 0.001:
         p = format(p, ".1e")
     return r, p
+
+def check_reads():
+    df_taxon_table = st.session_state['df_taxon_table']
+    df_samples = st.session_state['df_samples']
+
+    reads = df_taxon_table[df_samples]
+
+    # Convert to numeric, non-numeric values become NaN
+    numeric_reads = reads.apply(pd.to_numeric, errors='coerce')
+
+    # Check if any NaN appeared where there was data
+    is_numeric = numeric_reads.notna().all().all()
+
+    return is_numeric
 
 ########################################################################################################################
 # Title
@@ -1734,12 +1763,21 @@ def readdist_diagram():
         colors = get_colors_from_sequence(TTT_colorsequence, len(all_taxa))
 
     fig = go.Figure()
-    res = []
-    for c, taxon in enumerate(all_taxa):
-        y_values = df_taxon_table_simple_s[df_taxon_table_simple_s[fig_taxon] == taxon][df_samples].values.tolist()[0]
-        x_values = df_samples
-        fig.add_trace(go.Bar(x=x_values, y=y_values, name=taxon, marker=dict(color=colors[c])))
-        res.append(y_values)
+    if fig_mode == 'Relative Reads' or fig_mode == 'Absolute Reads':
+        res = []
+        for c, taxon in enumerate(all_taxa):
+            y_values = df_taxon_table_simple_s[df_taxon_table_simple_s[fig_taxon] == taxon][df_samples].values.tolist()[0]
+            x_values = df_samples
+            fig.add_trace(go.Bar(x=x_values, y=y_values, name=taxon, marker=dict(color=colors[c])))
+            res.append(y_values)
+    else:
+        res = []
+        for c, taxon in enumerate(all_taxa):
+            sub_df = df_taxon_table[df_taxon_table[fig_taxon] == taxon][df_samples]
+            y_values = [len([i for i in sub_df[sample].values.tolist() if i != 0]) for sample in df_samples]
+            x_values = df_samples
+            fig.add_trace(go.Bar(x=x_values, y=y_values, name=taxon, marker=dict(color=colors[c])))
+            res.append(y_values)
     
     df_data = pd.DataFrame(res, index=all_taxa, columns=x_values)
     df_data_rel = df_data.div(df_data.sum(axis=0), axis=1) * 100
@@ -1815,8 +1853,8 @@ def read_hash_autocorrelation():
     title = f'Read/{TTT_hash[:-1]} auto-correlation rho={rho} (p={p})'
 
     # Default Layout
-    fig.update_yaxes(title_font=dict(size=fontsize), tickfont=dict(size=fontsize))
-    fig.update_xaxes(title_font=dict(size=fontsize), tickfont=dict(size=fontsize))
+    fig.update_yaxes(title_font=dict(size=fontsize), tickfont=dict(size=fontsize), title=st.session_state['TTT_hash'])
+    fig.update_xaxes(title_font=dict(size=fontsize), tickfont=dict(size=fontsize), title='Reads')
     fig.update_layout(template=template, font_size=fontsize, showlegend=showlegend, title=title)
 
     # Plot
@@ -2769,6 +2807,75 @@ def nmds_plot():
         export_table("Beta_diversity", f"{name}_{fig_mode}_{fig_taxon}", nmds_df, "xlsx")
 
 ########################################################################################################################
+# Population Dynamics
+def haplotype_distribution():
+    # Layout
+    fontsize = st.session_state['TTT_fontsize']
+    template = st.session_state['TTT_template']
+    showlegend = st.session_state['TTT_showlegend']
+    TTT_colorscale = st.session_state['TTT_colorscale']
+    TTT_colorsequence = st.session_state['TTT_colorsequence']
+    TTT_color1 = st.session_state['TTT_color1']
+    TTT_jitter = st.session_state['TTT_jitter']
+    TTT_linewidth = st.session_state['TTT_linewidth']
+    TTT_scattersize = st.session_state['TTT_scattersize'] * 0.5
+    TTT_hash = st.session_state['TTT_hash']
+
+    # Tables
+    name = st.session_state['table_display_name'].stem
+    df_taxon_table = st.session_state['df_taxon_table'].copy()
+
+    # Options
+    df_metadata_table = st.session_state['df_metadata_table'].copy()
+    df_samples = st.session_state['df_samples'].copy()
+    haplotype_taxa = st.session_state['haplotype_taxa']
+    haplotype_level = st.session_state['haplotype_level']
+    name = st.session_state['table_display_name'].stem
+
+    colors = get_colors_from_scale(TTT_colorscale, len(haplotype_taxa))
+
+    fig = go.Figure()
+    output_lst = []
+    for c, haplotype_taxon in enumerate(haplotype_taxa):
+        sub_df = df_taxon_table[df_taxon_table[haplotype_level] == haplotype_taxon]
+
+        y_values = []
+        for sample in df_samples:
+            y_value = len([i for i in sub_df[sample].values.tolist() if i != 0])
+            y_values.append(y_value)
+
+
+        if haplotype_mode == 'Scatter':
+            fig.add_trace(go.Scatter(x=df_samples, y=y_values,
+                                     marker=dict(color=colors[c]),
+                                     name=haplotype_taxon, cliponaxis=False))
+            fig.update_yaxes(rangemode='tozero', title=TTT_hash)
+            fig.update_xaxes(dtick='linear')
+
+        elif haplotype_mode == 'Bar':
+            fig.add_trace(go.Bar(x=df_samples, y=y_values,
+                                 marker=dict(color=colors[c]),
+                                 name=haplotype_taxon))
+            fig.update_yaxes(rangemode='tozero', title=TTT_hash)
+            fig.update_xaxes(dtick='linear')
+            fig.update_layout(barmode='stack')
+        output_lst.append([haplotype_taxon] + y_values)
+
+    # Default Layout
+    fig.update_yaxes(title_font=dict(size=fontsize), tickfont=dict(size=fontsize))
+    fig.update_xaxes(title_font=dict(size=fontsize), tickfont=dict(size=fontsize))
+    fig.update_layout(template=template, font_size=fontsize, showlegend=showlegend, title=f'{haplotype_level}-level {TTT_hash}')
+
+    # Plot
+    st.plotly_chart(fig, config=st.session_state['TTT_config'])
+    export_plot('Haplotypes', f'{name}_{haplotype_level}_{haplotype_mode}', fig, 'plotly')
+
+    # Dataframe
+    res_df = pd.DataFrame(output_lst, columns=['Taxon'] + df_samples)
+    export_table("Haplotypes", f'{name}_{haplotype_level}_{haplotype_mode}', res_df, "xlsx")
+
+
+########################################################################################################################
 # Time Series
 def time_series_richness():
 
@@ -3027,6 +3134,24 @@ def gbif_upload_conversion():
     table_display_name = st.session_state['table_display_name']
     df_samples = st.session_state['df_samples']
 
+    # User input
+    gbif_target_gene = st.session_state['gbif_target_gene']
+    gbif_fwd_primer_name = st.session_state['gbif_fwd_primer_name']
+    gbif_fwd_primer_seq = st.session_state['gbif_fwd_primer_seq']
+    gbif_rvs_primer_name = st.session_state['gbif_rvs_primer_name']
+    gbif_rvs_primer_seq = st.session_state['gbif_rvs_primer_seq']
+
+    # Metadata Input
+    if gbif_date != 'None':
+        gbif_date_col = st.session_state['gbif_date']
+        gbif_date_values = df_metadata_table[gbif_date_col]
+    if gbif_lat != 'None':
+        gbif_lat_col = st.session_state['gbif_lat']
+        gbif_lat_values = df_metadata_table[gbif_lat_col]
+    if gbif_lon != 'None':
+        gbif_lon_col = st.session_state['gbif_lon']
+        gbif_lon_col_values = df_metadata_table[gbif_lon_col]
+
     # Create OTU Table (Sheet)
     OTU_table = df_taxon_table[df_samples]
     OTU_table.index = df_taxon_table['Hash']
@@ -3038,16 +3163,16 @@ def gbif_upload_conversion():
 
     # Create Samples Table (Sheet)
     samples_table = pd.DataFrame(df_samples, columns=['id'])
-    samples_table['decimalLatitude'] = ''
-    samples_table['decimalLongitude'] = ''
-    samples_table['eventDate'] = ''
+    samples_table['decimalLatitude'] = gbif_lat_values
+    samples_table['decimalLongitude'] = gbif_lon_col_values
+    samples_table['eventDate'] = gbif_date_col
 
     # Create Study Table (Sheet)
-    study_table = pd.DataFrame([['target_gene', ''],
-                                ['pcr_primer_forward', 'ACGT'],
-                                ['pcr_primer_name_forward', ''],
-                                ['pcr_primer_reverse', 'ACGT'],
-                                ['pcr_primer_name_reverse', ''],
+    study_table = pd.DataFrame([['target_gene', gbif_target_gene],
+                                ['pcr_primer_forward', gbif_fwd_primer_seq],
+                                ['pcr_primer_name_forward', gbif_fwd_primer_name],
+                                ['pcr_primer_reverse', gbif_rvs_primer_seq],
+                                ['pcr_primer_name_reverse', gbif_rvs_primer_name],
                                 ], columns=['term', 'value'])
 
     active_project_path = st.session_state['active_project_path']
@@ -3061,6 +3186,336 @@ def gbif_upload_conversion():
         study_table.to_excel(writer, sheet_name='Study', index=False)
 
     st.success('GBIF Upload Table was created!')
+    open_file(export_file)
+
+def gbif_taxonomy_validation():
+    pass
+
+def gbif_occurrence_download():
+    df_taxon_table = st.session_state['df_taxon_table'].copy()
+
+    username = 'till_macher'
+    password = 'ZN_kw7@!gBsABNn'
+    email = 'macher@uni-trier.de'
+
+    occ.download_get(key='0024088-260226173443078')
+
+    active_project_path = st.session_state['active_project_path']
+    folder_name = 'GBIF'
+    os.makedirs(active_project_path / folder_name, exist_ok=True)
+    specieskey_json = active_project_path / folder_name / f"GBIF_speciesKeys.json"
+    records_dict = {}
+    if specieskey_json.exists():
+        with open(specieskey_json, "r") as f:
+            records_dict = json.load(f)
+
+    if 'speciesKey' in df_taxon_table.columns.tolist():
+        unique_keys = [i for i in df_taxon_table['speciesKey'].unique() if i != '']
+        for specieskey in unique_keys:
+            specieskey = int(specieskey)
+            if str(specieskey) not in records_dict.keys():
+                try:
+                    res = occ.search(taxonKey=specieskey, limit=300)
+                    records_dict[str(specieskey)] = res['results']
+                except:
+
+                    records_dict[str(specieskey)] = ''
+    else:
+        st.warning('Please run the GBIF basics tool first!')
+
+    with open(specieskey_json, "w") as f:
+        json.dump(records_dict, f)
+
+########################################################################################################################
+# Map Modules
+def sample_map():
+
+    # Style
+    fontsize = st.session_state['TTT_fontsize']
+    template = st.session_state['TTT_template']
+    showlegend = st.session_state['TTT_showlegend']
+    scattersize = st.session_state['TTT_scattersize']
+    showlabels = st.session_state['nmds_showlabels']
+    linewidth = st.session_state['TTT_linewidth']
+    TTT_color1 = st.session_state['TTT_color1']
+    TTT_color2 = st.session_state['TTT_color2']
+    map_style = st.session_state['map_style']
+    sample_radius = st.session_state['sample_radius']
+    map_zoom = st.session_state['map_zoom']
+    map_groups = st.session_state['map_groups']
+    fig_color = st.session_state['map_color']
+    map_save = st.session_state['map_save']
+
+    name = st.session_state['table_display_name'].stem
+    df_taxon_table = st.session_state['df_taxon_table'].copy()
+    df_metadata_table = st.session_state['df_metadata_table'].copy()
+    df_samples = st.session_state['df_samples']
+    table_display_name = st.session_state['table_display_name']
+
+    # Colors
+    groups = df_metadata_table[map_groups].unique()
+    n_groups = len(groups)
+    if fig_color == 'Color Scale':
+        colors = get_colors_from_scale(TTT_colorscale, n_groups)
+    if fig_color == 'Color Sequence':
+        colors = get_colors_from_sequence(TTT_colorsequence, n_groups)
+    if fig_color == 'Single Color':
+        colors = [TTT_color1] * n_groups
+    df_metadata_table = colors_to_metadata(df_metadata_table, map_groups, colors)
+
+    ####################################################################################################
+    # Prepare site table
+    lon_col = "Longitude"
+    lat_col = "Latitude"
+    df_sites = df_metadata_table[["Samples", lat_col, lon_col]].copy()
+    df_sites.columns = ["site", "lat", "lon"]
+    # Drop samples without Lat Long
+    df_sites = df_sites[(df_sites['lat'] != '') & (df_sites['lon'] != '')]
+    df_sites['color'] = df_metadata_table['TTT_metadatacolor']
+    if len(df_sites) == 0:
+        return
+
+    ####################################################################################################
+    # Create GeoDataFrame
+    gdf = gpd.GeoDataFrame(df_sites, geometry=gpd.points_from_xy(df_sites.lon, df_sites.lat), crs="EPSG:4326")
+    ####################################################################################################
+    # Project to meters for buffering
+    gdf_m = gdf.to_crs("EPSG:3035")
+    # Create circular buffers
+    gdf_m["buffer"] = gdf_m.buffer(sample_radius * 1000)
+    ####################################################################################################
+    # Convert buffers back to WGS84
+    buffers_wgs = gdf_m.set_geometry("buffer").to_crs("EPSG:4326")
+    ####################################################################################################
+    # Merge overlapping buffers
+    merged_buffers = buffers_wgs["buffer"].union_all()
+    # Optional simplification for faster plotting
+    merged_buffers = merged_buffers.simplify(0.001)
+    ####################################################################################################
+    # Handle Polygon / MultiPolygon
+    if isinstance(merged_buffers, Polygon):
+        polygons = [merged_buffers]
+    elif isinstance(merged_buffers, MultiPolygon):
+        polygons = list(merged_buffers.geoms)
+    else:
+        polygons = []
+    ####################################################################################################
+    # Create plot
+    fig = go.Figure()
+    # Add merged buffer polygons
+    showlegend = False
+    for poly in polygons:
+        lon_outline, lat_outline = poly.exterior.coords.xy
+        fig.add_trace(go.Scattermap(
+                lat=list(lat_outline),
+                lon=list(lon_outline),
+                mode="lines", fill="toself", fillcolor="rgba(0,0,0,0.1)", line=dict(width=2, color=TTT_color2),
+                name="Sampling buffer", showlegend=showlegend))
+    ####################################################################################################
+    # Add sample points
+    fig.add_trace(
+        go.Scattermap(
+            lon=df_sites["lon"],
+            lat=df_sites["lat"],
+            text=df_sites["site"],
+            mode="markers+text",
+            marker=dict(size=scattersize*1.1, color=df_sites["color"]),
+            textfont=dict(size=fontsize, color="black"),
+            textposition="top center", showlegend=False,
+            name="Samples"))
+    ####################################################################################################
+    # Map layout
+    fig.update_layout(
+        map=dict(
+            style=map_style,
+            zoom=map_zoom,
+            center=dict(lat=df_sites["lat"].mean(), lon=df_sites["lon"].mean())),
+            title=f"{table_display_name.stem} – Sampling Sites ({sample_radius} km)")
+    ####################################################################################################
+    # Show map in Streamlit
+    st.plotly_chart(fig, width='stretch', height=TTT_height, config=st.session_state['TTT_config'])
+
+    if map_save == 'Yes':
+        export_plot("Maps", f"{name}_map", fig, "plotly")
+
+def gbif_occurrence_validation():
+
+    df_taxon_table = st.session_state['df_taxon_table'].copy()
+    df_metadata_table = st.session_state['df_metadata_table'].copy()
+    df_samples = st.session_state['df_samples']
+    table_display_name = st.session_state['table_display_name']
+    name = table_display_name.stem
+    sample_radius = st.session_state['sample_radius']  # km
+
+    # check if table exists
+    active_project_path = st.session_state['active_project_path']
+    folder_name = 'Maps'
+    suffix = f"{name}_gbif_{sample_radius}km"
+    file_xlsx = active_project_path / folder_name / f'{suffix}.xlsx'
+
+    if file_xlsx.exists():
+        st.info('Occurrence Analysis was already conducted: Please delete the output file to rerun the analysis!')
+        return
+
+    # Prepare sites
+    lon_col, lat_col = "Longitude", "Latitude"
+    df_sites = df_metadata_table[["Samples", lat_col, lon_col]].copy()
+    df_sites.columns = ["site", "lat", "lon"]
+    df_sites = df_sites[(df_sites['lat'] != '') & (df_sites['lon'] != '')]
+
+    # Convert to GeoDataFrame
+    gdf = gpd.GeoDataFrame(df_sites, geometry=gpd.points_from_xy(df_sites.lon, df_sites.lat), crs="EPSG:4326")
+
+    # Project to meters, create circular buffers
+    gdf_m = gdf.to_crs("EPSG:3035")
+    gdf_m["buffer"] = gdf_m.buffer(sample_radius * 1000)
+
+    # Convert back to WGS84, simplify, and force counter-clockwise
+    def buffer_to_wkt(buf):
+        buf_simplified = buf.simplify(0.01, preserve_topology=True)
+        buf_ccw = orient(buf_simplified, sign=1.0)
+        return buf_ccw.wkt
+
+    buffers_wgs = gdf_m.set_geometry("buffer").to_crs("EPSG:4326")
+    df_sites["polygon"] = buffers_wgs["buffer"].apply(buffer_to_wkt)
+
+    # Initialize occurrence counts per species
+    species_keys = [i for i in df_taxon_table['Species'].unique() if i != '']
+    res = []
+    for species_name in stqdm(species_keys, desc='GBIF occurrence query'):
+        counts = [species_name]
+        for _, row in df_sites.iterrows():
+            try:
+                gbif_res = occ.search(scientificName=species_name, geometry=row["polygon"], limit=0)
+                counts.append(gbif_res["count"])
+            except Exception:
+                counts.append(0)
+            time.sleep(0.1)
+        res.append(counts)
+    res_df = pd.DataFrame(res, columns=['Species'] + df_samples)
+
+    # calculate correlation to identify species which are unlikely to occur
+    df_taxon_table_s = simple_taxon_table(df_taxon_table)[['Species'] + df_samples]
+    df_taxon_table_s = df_taxon_table_s[df_taxon_table_s['Species'] != '']
+    df_relative = df_taxon_table_s.copy()
+    df_relative[df_samples] = df_relative[df_samples].div(df_relative[df_samples].sum(axis=0), axis=1)
+    df_relative[df_samples] = df_relative[df_samples] * 100
+    df_relative = df_relative.round(4)
+
+    # Melt both tables to long format
+    gbif_long = res_df.melt(id_vars='Species', var_name='Sample', value_name='GBIF (occ.)')
+    reads_long = df_relative.melt(id_vars='Species', var_name='Sample', value_name='Reads (%)')
+    # Merge by Species and Sample
+    combined_long = pd.merge(reads_long, gbif_long, on=['Species', 'Sample'])
+    # Optional: reorder columns
+    combined_long = combined_long[['Sample', 'Species', 'Reads (%)', 'GBIF (occ.)']]
+    combined_long = combined_long.sort_values(['Species', 'Sample'])
+
+    # Export Table
+    export_table("Maps", suffix, combined_long, "xlsx", False)
+
+def taxon_distribution_map():
+    df_taxon_table = st.session_state['df_taxon_table'].copy()
+    df_metadata_table = st.session_state['df_metadata_table'].copy()
+    df_samples = st.session_state['df_samples']
+    table_display_name = st.session_state['table_display_name']
+    name = table_display_name.stem
+    distmap_level = st.session_state['distmap_level']
+    distmap_taxon = st.session_state['distmap_taxon']
+    TTT_colorscale = st.session_state['TTT_colorscale']
+    map_style = st.session_state['distmap_style']
+    map_zoom = st.session_state['distmap_zoom']
+    distmap_save = st.session_state['distmap_save']
+    distmap_measure = st.session_state['distmap_measure']
+    TTT_scattersize = st.session_state['TTT_scattersize']
+
+    ####################################################################################################
+    # Filter to taxon to display
+    if distmap_measure == 'Rel. Reads':
+        df_taxon_table_s = simple_taxon_table(df_taxon_table)
+        df_relative = df_taxon_table_s.copy()
+        df_relative[df_samples] = df_relative[df_samples].div(df_relative[df_samples].sum(axis=0), axis=1)
+        df_relative[df_samples] = df_relative[df_samples] * 100
+        alpha_div_values = df_relative[df_relative[distmap_level] == distmap_taxon][df_samples].sum().values.tolist()
+        title=f'{distmap_taxon} (Rel. Reads)'
+        cmin, cmax = 0, 100
+    else:
+        df_taxon_table_s = df_taxon_table[df_taxon_table[distmap_level] == distmap_taxon]
+        alpha_div_values = []
+        for sample in df_samples:
+            n_hashes = len(df_taxon_table_s[df_taxon_table_s[sample] != 0])
+            alpha_div_values.append(n_hashes)
+        title=f'{distmap_taxon} ({st.session_state["TTT_hash"]})'
+        cmin, cmax = 1, max(alpha_div_values)+1
+
+    ####################################################################################################
+    # Prepare site table
+    lon_col = "Longitude"
+    lat_col = "Latitude"
+    df_sites = df_metadata_table[["Samples", lat_col, lon_col]].copy()
+    df_sites.columns = ["site", "lat", "lon"]
+    # Drop samples without Lat Long
+    df_sites = df_sites[(df_sites['lat'] != '') & (df_sites['lon'] != '')]
+    df_sites[distmap_taxon] = alpha_div_values
+    if len(df_sites) == 0:
+        return
+
+    ####################################################################################################
+    # Create figure
+    fig = go.Figure()
+
+    # add no detection samples
+    fig_df = df_sites[df_sites[distmap_taxon] == 0.0]
+    fig.add_trace(go.Scattermap(
+        lat=fig_df['lat'],
+        lon=fig_df['lon'],
+        mode='markers+text',
+        text=fig_df['site'],
+        textposition='top center',
+        showlegend=False,
+        hovertext=fig_df[distmap_taxon],
+        marker=dict(
+            size=TTT_scattersize*2,  # marker size
+            color='white',  # the column you want to color by
+            opacity=0.3,
+        )
+    ))
+
+    # add detection samples
+    fig_df = df_sites[df_sites[distmap_taxon] > 0]
+    fig.add_trace(go.Scattermap(
+        lat=fig_df['lat'],
+        lon=fig_df['lon'],
+        mode='markers+text',
+        text=fig_df['site'],
+        textposition='top center',
+        line=dict(width=1, color='black'),
+        showlegend=False,
+        hovertext=fig_df[distmap_taxon],
+        marker=dict(
+            size=TTT_scattersize*2,  # marker size
+            color=fig_df[distmap_taxon],
+            colorscale=TTT_colorscale,
+            colorbar=dict(title=title),
+            cmin=cmin,
+            cmax=cmax,
+            opacity=0.9
+        )
+    ))
+
+    ####################################################################################################
+    # Map layout
+    fig.update_layout(
+        map=dict(
+            style=map_style,
+            zoom=map_zoom,
+            center=dict(lat=df_sites["lat"].mean(), lon=df_sites["lon"].mean())),
+            title=f"{table_display_name.stem} – {distmap_taxon}")
+    ####################################################################################################
+    st.plotly_chart(fig, width='stretch', height=TTT_height, config=st.session_state['TTT_config'])
+
+    if distmap_save == 'Yes':
+        export_plot("Maps", f"{name}_{distmap_taxon}_{distmap_measure}_distmap", fig, "plotly")
 
 ########################################################################################################################
 # ESC calculation
@@ -3724,6 +4179,11 @@ with st.sidebar:
                 # Taxon columns
                 st.session_state['df_taxon_cols'] = ['Kingdom', 'Phylum', 'Class', 'Order', 'Family', 'Genus', 'Species']
 
+                if check_reads() == False:
+                    st.error('⚠️ Your read table seems to include non-numeric values! Please check your Taxon Table! ⚠️')
+                    del st.session_state["df_taxon_table"]
+                    del st.session_state["table_display_name"]
+
             if 'df_taxon_table' in st.session_state and 'table_display_name' in st.session_state:
                 st.success(f'Active table: {st.session_state["table_display_name"].stem}')
                 if st.button('📄 Open Active Table', width='stretch'):
@@ -3759,7 +4219,7 @@ with st.sidebar:
                 "displaylogo": False,  # remove plotly logo
                 "toImageButtonOptions": {
                     "format": "svg",  # png, svg, jpeg, webp
-                    "filename": "my_plot",
+                    "filename": "TTT_plot",
                     "height": st.session_state['TTT_height'],
                     "width": st.session_state['TTT_width']
                 },
@@ -3825,6 +4285,12 @@ if path_to_projects.exists():
 
     st.markdown("## 🧬 Create Taxon Table")
     with st.expander(expanded=expanded, label='See more'):
+        st.success(
+            "This section allows you to generate a **Taxon Table** by combining read and taxonomy data from your project imports. "
+            "Select the appropriate read and taxonomy tables, choose import formats, and provide a name for the new Taxon Table. "
+            "The resulting table will be ready for downstream analyses such as diversity calculations, plotting, and ecological assessments."
+        )
+
         # Collect import files
         import_folder = active_project_path / 'Import'
         import_folder_files = sorted([p for p in import_folder.glob('*') if p.suffix in ('.xlsx', '.snappy') and not p.name.startswith(('~$', '.'))])
@@ -3856,6 +4322,11 @@ if 'df_taxon_table' in st.session_state and 'table_display_name' in st.session_s
     ########################################################################################################################
     st.markdown("## 🖥️ Basic Stats")
     with st.expander(expanded=True, label='See more'):
+        st.success(
+            "This section provides an overview of key statistics describing your dataset. "
+            "It summarizes sequencing depth, OTU richness, taxonomic resolution, and the most abundant taxa across samples. "
+            "These metrics help assess data quality and give a first impression of biodiversity patterns in your dataset.")
+
         col1, col2 = st.columns(2)
         with col1:
             basic_stats_reads()
@@ -3875,6 +4346,10 @@ if 'df_taxon_table' in st.session_state and 'table_display_name' in st.session_s
     ########################################################################################################################
     st.markdown("## 🛠️ Table Processing")
     with st.expander(expanded=False, label='See more'):
+        st.success(
+            "This section allows you to process your taxon table before downstream analyses. "
+            "You can merge replicates, subtract negative controls, filter by reads, samples, taxa, or traits, "
+            "and apply normalization to make your data comparable across samples. ")
 
         st.write('### Replicate Merging')
          # --- Overview Metrics ---
@@ -3936,7 +4411,7 @@ if 'df_taxon_table' in st.session_state and 'table_display_name' in st.session_s
         with col3:
             missing_replicates_handling = st.selectbox(label=f"Handle samples which miss replicates:",options=['Keep', 'Remove'], key='missing_replicates_handling')
         # --- Action Button ---
-        if st.button("🔄 Merge Replicates", use_container_width=True):
+        if st.button("🔄 Merge Replicates", width='stretch'):
             replicate_merging()
         st.divider()
 
@@ -3953,7 +4428,7 @@ if 'df_taxon_table' in st.session_state and 'table_display_name' in st.session_s
         st.session_state['df_NC_samples'] = df_NC_samples
         st.info(f'Found {len(df_NC_samples)} Negative Controls in {len(st.session_state["df_samples"])} samples!')
         # --- Action Button ---
-        if st.button("🔄 Subtract Negative Controls", use_container_width=True):
+        if st.button("🔄 Subtract Negative Controls", width='stretch'):
             NC_subtraction()
         st.divider()
 
@@ -3971,7 +4446,7 @@ if 'df_taxon_table' in st.session_state and 'table_display_name' in st.session_s
             if read_filter == 'Relative Reads':
                 read_filter_value = st.number_input(label='Relative Read Threshold (%):', value=1.00, key='read_filter_value', max_value=100.00)
         # --- Action Button ---
-        if st.button("🔄 Apply read-based filter", use_container_width=True):
+        if st.button("🔄 Apply read-based filter", width='stretch'):
             read_based_filter()
         st.divider()
 
@@ -3993,7 +4468,7 @@ if 'df_taxon_table' in st.session_state and 'table_display_name' in st.session_s
             st.info(f"{len(samples_below)}/{len(st.session_state['df_samples'])} samples fall within the normalisation threshold.")
         st.info(f"Normalsation value: {st.session_state['sub_sample_size']:,} reads.")
         # --- Action Button ---
-        if st.button("🔄 Apply read-based normalisation", use_container_width=True):
+        if st.button("🔄 Apply read-based normalisation", width='stretch'):
             read_based_normalisation()
         st.divider()
 
@@ -4010,7 +4485,7 @@ if 'df_taxon_table' in st.session_state and 'table_display_name' in st.session_s
             selected_taxa = st.multiselect(label='Select Taxa:', options=available_taxa, default=available_taxa, key='selected_taxa')
         st.info(f"Selected {len(selected_taxa)} of {len(available_taxa)} taxa.")
         # --- Action Button ---
-        if st.button("🔄 Apply taxonomy filter", use_container_width=True):
+        if st.button("🔄 Apply taxonomy filter", width='stretch'):
             taxonomic_filter()
         st.divider()
 
@@ -4028,7 +4503,7 @@ if 'df_taxon_table' in st.session_state and 'table_display_name' in st.session_s
             st.session_state['samples_to_filter'] = samples_to_filter
         st.info(f"Selected {len(selected_samples)} of {len(available_samples)} samples.")
         # --- Action Button ---
-        if st.button("🔄 Apply sample filter", use_container_width=True):
+        if st.button("🔄 Apply sample filter", width='stretch'):
             sample_filter()
         st.divider()
 
@@ -4068,13 +4543,17 @@ if 'df_taxon_table' in st.session_state and 'table_display_name' in st.session_s
                 st.session_state['trait_type'] = 'string'
                 st.info(f"Selected {len(selected_trait_values)} of {len(available_trait_values)} trait values.")
         # --- Action Button ---
-        if st.button("🔄 Apply trait filter", use_container_width=True):
+        if st.button("🔄 Apply trait filter", width='stretch'):
             trait_filter()
         st.divider()
 
     ########################################################################################################################
     st.markdown("## 🔁 Table Conversion")
     with st.expander(expanded=False, label='See more'):
+        st.success(
+            "This section provides tools to convert and enhance your taxon tables. "
+            "You can simplify redundant entries, combine multiple tables, import traits, sort or rename samples, "
+            "and export your data to FASTA format. Use the buttons below to apply each step interactively.")
 
         st.write('### Simplify Taxon Table')
         # --- Initialize structure ---
@@ -4085,7 +4564,7 @@ if 'df_taxon_table' in st.session_state and 'table_display_name' in st.session_s
             f"read abundance and sequence similarity."
         )
         # --- Action Button ---
-        if st.button("🔄 Simplify Taxon Table", use_container_width=True):
+        if st.button("🔄 Simplify Taxon Table", width='stretch'):
             simplify_table()
         st.divider()
 
@@ -4100,7 +4579,7 @@ if 'df_taxon_table' in st.session_state and 'table_display_name' in st.session_s
                 st.write('')
                 st.info('Please provide a Taxon Table to continue!')
         # --- Action Button ---
-        if st.button("🔄 Merge Selected Taxon Tables", use_container_width=True):
+        if st.button("🔄 Merge Selected Taxon Tables", width='stretch'):
             merge_taxon_tables()
         st.divider()
 
@@ -4124,7 +4603,7 @@ if 'df_taxon_table' in st.session_state and 'table_display_name' in st.session_s
                 st.session_state['trait_import_taxon'] = trait_import_df.columns.tolist()[0]
                 st.info(f'Selected taxon: {st.session_state["trait_import_taxon"]}')
         # --- Action Button ---
-        if st.button("🔄 Add Traits From File", use_container_width=True):
+        if st.button("🔄 Add Traits From File", width='stretch'):
             if trait_import_table != None:
                 add_traits_from_file()
         st.divider()
@@ -4134,7 +4613,7 @@ if 'df_taxon_table' in st.session_state and 'table_display_name' in st.session_s
         # --- Initialize structure ---
         st.info('Sort your Metadata Table as desired. The samples of the Taxon Table will then be sorted accordingly!')
         # --- Action Button ---
-        if st.button("🔄 Sort Samples", use_container_width=True):
+        if st.button("🔄 Sort Samples", width='stretch'):
             sort_samples()
         st.divider()
 
@@ -4148,7 +4627,7 @@ if 'df_taxon_table' in st.session_state and 'table_display_name' in st.session_s
             st.write('')
             st.info(f'Samples will be renamed according to metadata category "{sample_rename_metadata}". Old samples names are stored in the Metadata Table.')
         # --- Action Button ---
-        if st.button("🔄 Rename Samples", use_container_width=True):
+        if st.button("🔄 Rename Samples", width='stretch'):
             sample_rename()
         st.divider()
 
@@ -4157,113 +4636,33 @@ if 'df_taxon_table' in st.session_state and 'table_display_name' in st.session_s
         # --- Initialize structure ---
         st.info(f"{st.session_state['TTT_hash']} will be exported to .FASTA format.")
         # --- Action Button ---
-        if st.button("🔄 Export Table To Fasta", use_container_width=True):
+        if st.button("🔄 Export Table To Fasta", width='stretch'):
             export_fasta()
         st.divider()
 
     ########################################################################################################################
-    st.markdown("## 🧪 Sample Comparison")
+    st.markdown("## 📈 Metabarcoding Basics")
     with st.expander(expanded=False, label='See more'):
+        st.success(
+            "This section allows you to explore the distribution and diversity of reads across your samples. "
+            "You can generate read distribution diagrams, perform read-based rarefaction to assess sampling depth, "
+            "and check read-to-OTU/sequence autocorrelation per sample."
+        )
 
-        st.write('### Venn Diagram')
-        # --- Initialize structure ---
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            venn_metadata = st.selectbox(label='Select Metadata Category:', options=available_metadata, key='venn_metadata')
-            venn_categories = [str(i) for i in st.session_state['df_metadata_table'][venn_metadata].unique() if i != '']
-            st.info(f"Groups: {', '.join(list(venn_categories)[:10])}")
-        with col2:
-            venn_taxon_level = st.selectbox(label='Select taxonomic level:', options=st.session_state['taxa_cols2'], key='venn_taxon_level')
-        with col3:
-            venn_weighted = st.selectbox(label='Weighted Circle Sizes:', options=['Weighted', 'Non-weighted'], key='venn_weighted')
-            venn_display = st.selectbox(label='Display Values:', options=['Values', 'Rel. Values', 'Both'], key='venn_display')
-        # --- Action Button ---
-        if len(venn_categories) >= 4:
-            st.error('Please choose a Metadata with 2-3 Categories! Use an UpSet Chart instead!')
-        elif st.button(f"🔄 Generate Venn{len(venn_categories)} Diagram", use_container_width=True):
-            venn_diagram()
-        st.divider()
-
-    ########################################################################################################################
-    st.markdown("## 📈 Read Proportions")
-    with st.expander(expanded=False, label='See more'):
-
-        st.write('### Read Distribution Diagram')
+        st.write(f'### Read/{st.session_state["TTT_hash"][:-1]} Distribution Plot')
         # --- Initialize structure ---
         col1, col2, col3 = st.columns(3)
         with col1:
             readdist_taxon = st.selectbox(label='Select Taxonomic Level:', options=st.session_state['taxa_cols'], index=2, key='readdist_taxon')
             readdist_level = st.selectbox(label='Select Sample Level:', options=['Samples'] + available_metadata, key='readdist_level')
         with col2:
-            readdist_mode = st.selectbox(label='Select Display Mode:', options=['Relative Reads', 'Absolute Reads'], key='readdist_mode')
+            readdist_mode = st.selectbox(label='Select Display Mode:', options=['Relative Reads', 'Absolute Reads', st.session_state["TTT_hash"]], key='readdist_mode')
             readdist_nan = st.selectbox(label='Handle Missing Taxonomy:', options=['Exclude', 'Include'], key='readdist_nan')
         with col3:
             readdist_color = st.selectbox(label='Select Color Mode:', options=['Color Sequence', 'Color Scale'], key='readdist_color')
         # --- Action Button ---
-        if st.button(f"🔄 Generate Read Distribution Diagram", use_container_width=True):
+        if st.button(f"🔄 Generate Read Distribution Diagram", width='stretch'):
             readdist_diagram()
-        st.divider()
-
-        st.write(f'### Read-based Rarefaction')
-        # --- Initialize structure ---
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            read_rarefaction_reps = st.number_input(label='Number of Repetitions:', min_value=10, max_value=5000, value=10, key='read_rarefaction_reps')
-            read_rarefaction_splits = st.number_input(label='Number of Sampling Points (X-Axis):', min_value=10, max_value=100, value=10, key='read_rarefaction_splits')
-        with col2:
-            read_rarefaction_taxon = st.selectbox(label='Select Taxonomic Level:', options=st.session_state['taxa_cols2'], index=6, key='read_rarefaction_taxon')
-            read_rarefaction_display = st.selectbox(label='Select Y-Axis Scaling:', options=['Absolute', 'Relative'], key='read_rarefaction_display')
-        with col3:
-            read_rarefaction_color = st.selectbox(label='Select Color Mode:', options=['Color Scale', 'Color Sequence', 'Single Color'], index=2, key='read_rarefaction_color')
-        st.info('Please note that read-based rarefaction analyses can take very long, especially with high sequencing depths!')
-        # --- Action Button ---
-        if st.button(f"🔄 Calculate Rarefaction Curves", use_container_width=True):
-            read_rarefaction()
-        st.divider()
-
-        st.write(f'### Read/{TTT_hash[:-1]} Auto-correlation')
-        # --- Initialize structure ---
-        st.info(f'Correlate the number of Reads and {TTT_hash} per sample.')
-        # --- Action Button ---
-        if st.button(f"🔄 Calculate Read/{TTT_hash[:-1]} Auto-correlation", use_container_width=True):
-            read_hash_autocorrelation()
-        st.divider()
-
-    ########################################################################################################################
-    st.markdown("## 🌱 Alpha Diversity")
-    with st.expander(expanded=False, label='See more'):
-
-        st.write('### Alpha Diversity Diagram')
-        # --- Initialize structure ---
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            alphadiv_taxon = st.selectbox(label='Alpha Diversity Measure:', options=st.session_state['taxa_cols2'], index=6, key='alphadiv_taxon')
-            alphadiv_measure = st.selectbox(label='Alpha Diversity Calculation:', options=['Richness', 'Heip Evenness', 'Pielou Evenness', 'Shannon Diversity'], key='alphadiv_measure', help=help_alphadiv)
-            if alphadiv_measure != 'Richness' and alphadiv_taxon == 'Hash':
-                alphadiv_mode = st.selectbox(label='Select Quantification:', options=['Rel. Reads'], key='alphadiv_mode')
-            elif alphadiv_measure != 'Richness' and alphadiv_taxon != 'Hash':
-                alphadiv_mode = st.selectbox(label='Select Quantification:', options=[f'{TTT_hash[:-1]} Richness', 'Rel. Reads'], key='alphadiv_mode')
-            else:
-                alphadiv_mode = st.selectbox(label='Select Quantification:', options=['None'], key='alphadiv_mode')
-        with col2:
-            alphadiv_layout = st.selectbox(label='Select Display Mode:', options=['Bar', 'Scatter', 'Box', 'Violin'], key='alphadiv_layout')
-            if alphadiv_layout == 'Bar' or alphadiv_layout == 'Scatter':
-                alphadiv_level = st.selectbox(label='Select Sample Level:', options=['Samples'], key='alphadiv_level')
-            else:
-                alphadiv_level = st.selectbox(label='Select Sample Level:', options=available_metadata, key='alphadiv_level')
-            if alphadiv_measure != 'Richness' and alphadiv_measure != 'Shannon Diversity':
-                alphadiv_interpration = st.selectbox(label='Add Interpretation Lines:', options=['Yes', 'No'], key='alphadiv_interpration')
-            else:
-                st.session_state['alphadiv_interpration'] = 'No'
-        with col3:
-            alphadiv_color = st.selectbox(label='Select Color Mode:', options=['Color Scale', 'Color Sequence', 'Single Color'], key='alphadiv_color')
-            if alphadiv_layout == 'Box' or alphadiv_layout == 'Violin':
-                alphadiv_boxpoints = st.selectbox(label='Boxpoints Display:', options=['All', 'False'], key='alphadiv_boxpoints')
-            else:
-                st.session_state['alphadiv_boxpoints'] = 'NAN'
-        # --- Action Button ---
-        if st.button(f"🔄 Generate {alphadiv_taxon} {alphadiv_measure} Diagram", use_container_width=True):
-            alphadiv_diagram()
         st.divider()
 
         st.write('### Circle Diagram')
@@ -4299,13 +4698,85 @@ if 'df_taxon_table' in st.session_state and 'table_display_name' in st.session_s
             pycircos_nan = st.selectbox(label='Handle Missing Taxonomy:', options=['Exclude', 'Include'], key='pycircos_nan')
             pycircos_inner_labels = st.selectbox(label='Inner Labels:', options=['Show', 'Hide'], key='pycircos_inner_labels')
         # --- Action Button ---
-        if st.button(f"🔄 Generate Pycircos Diagram", use_container_width=True):
+        if st.button(f"🔄 Generate Pycircos Diagram", width='stretch'):
             pycircos_plot()
+        st.divider()
+
+        st.write(f'### Read-based Rarefaction')
+        # --- Initialize structure ---
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            read_rarefaction_reps = st.number_input(label='Number of Repetitions:', min_value=10, max_value=5000, value=10, key='read_rarefaction_reps')
+            read_rarefaction_splits = st.number_input(label='Number of Sampling Points (X-Axis):', min_value=10, max_value=100, value=10, key='read_rarefaction_splits')
+        with col2:
+            read_rarefaction_taxon = st.selectbox(label='Select Taxonomic Level:', options=st.session_state['taxa_cols2'], index=6, key='read_rarefaction_taxon')
+            read_rarefaction_display = st.selectbox(label='Select Y-Axis Scaling:', options=['Absolute', 'Relative'], key='read_rarefaction_display')
+        with col3:
+            read_rarefaction_color = st.selectbox(label='Select Color Mode:', options=['Color Scale', 'Color Sequence', 'Single Color'], index=2, key='read_rarefaction_color')
+        st.info('Please note that read-based rarefaction analyses can take very long, especially with high sequencing depths!')
+        # --- Action Button ---
+        if st.button(f"🔄 Calculate Rarefaction Curves", width='stretch'):
+            read_rarefaction()
+        st.divider()
+
+        st.write(f'### Read/{TTT_hash[:-1]} Auto-correlation')
+        # --- Initialize structure ---
+        st.info(f'Correlate the number of Reads and {TTT_hash} per sample.')
+        # --- Action Button ---
+        if st.button(f"🔄 Calculate Read/{TTT_hash[:-1]} Auto-correlation", width='stretch'):
+            read_hash_autocorrelation()
+        st.divider()
+
+    ########################################################################################################################
+    st.markdown("## 🌱 Alpha Diversity")
+    with st.expander(expanded=False, label='See more'):
+        st.success(
+            "Explore the alpha diversity of your samples in this section. "
+            "You can generate alpha diversity diagrams using various metrics and visualization types, "
+            "and visualize hierarchical relationships with PyCircos circle diagrams."
+        )
+
+        st.write('### Alpha Diversity Diagram')
+        # --- Initialize structure ---
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            alphadiv_taxon = st.selectbox(label='Alpha Diversity Measure:', options=st.session_state['taxa_cols2'], index=6, key='alphadiv_taxon')
+            alphadiv_measure = st.selectbox(label='Alpha Diversity Calculation:', options=['Richness', 'Heip Evenness', 'Pielou Evenness', 'Shannon Diversity'], key='alphadiv_measure', help=help_alphadiv)
+            if alphadiv_measure != 'Richness' and alphadiv_taxon == 'Hash':
+                alphadiv_mode = st.selectbox(label='Select Quantification:', options=['Rel. Reads'], key='alphadiv_mode')
+            elif alphadiv_measure != 'Richness' and alphadiv_taxon != 'Hash':
+                alphadiv_mode = st.selectbox(label='Select Quantification:', options=[f'{TTT_hash[:-1]} Richness', 'Rel. Reads'], key='alphadiv_mode')
+            else:
+                alphadiv_mode = st.selectbox(label='Select Quantification:', options=['None'], key='alphadiv_mode')
+        with col2:
+            alphadiv_layout = st.selectbox(label='Select Display Mode:', options=['Bar', 'Scatter', 'Box', 'Violin'], key='alphadiv_layout')
+            if alphadiv_layout == 'Bar' or alphadiv_layout == 'Scatter':
+                alphadiv_level = st.selectbox(label='Select Sample Level:', options=['Samples'], key='alphadiv_level')
+            else:
+                alphadiv_level = st.selectbox(label='Select Sample Level:', options=available_metadata, key='alphadiv_level')
+            if alphadiv_measure != 'Richness' and alphadiv_measure != 'Shannon Diversity':
+                alphadiv_interpration = st.selectbox(label='Add Interpretation Lines:', options=['Yes', 'No'], key='alphadiv_interpration')
+            else:
+                st.session_state['alphadiv_interpration'] = 'No'
+        with col3:
+            alphadiv_color = st.selectbox(label='Select Color Mode:', options=['Color Scale', 'Color Sequence', 'Single Color'], key='alphadiv_color')
+            if alphadiv_layout == 'Box' or alphadiv_layout == 'Violin':
+                alphadiv_boxpoints = st.selectbox(label='Boxpoints Display:', options=['All', 'False'], key='alphadiv_boxpoints')
+            else:
+                st.session_state['alphadiv_boxpoints'] = 'NAN'
+        # --- Action Button ---
+        if st.button(f"🔄 Generate {alphadiv_taxon} {alphadiv_measure} Diagram", width='stretch'):
+            alphadiv_diagram()
         st.divider()
 
     ########################################################################################################################
     st.markdown("## 🌎 Beta Diversity")
     with st.expander(expanded=False, label='See more'):
+        st.success(
+            "This section allows you to explore beta diversity across your samples. "
+            "You can generate distance/dissimilarity matrices, perform PCoA and NMDS analyses, "
+            "and visualize multivariate relationships between samples and groups."
+        )
 
         st.write('### Beta Diversity Matrix')
         # --- Initialize structure ---
@@ -4320,7 +4791,7 @@ if 'df_taxon_table' in st.session_state and 'table_display_name' in st.session_s
             betadiv_color = st.selectbox(label='Matrix Values:', options=['Show', 'Hide'], key='betadiv_labels')
             richness_nan = st.selectbox(label='Handle Missing Taxonomy:', options=['Exclude', 'Include'], key='betadiv_nan')
         # --- Action Button ---
-        if st.button(f"🔄 Generate {betadiv_calculation} {betadiv_measure} Diagram", use_container_width=True):
+        if st.button(f"🔄 Generate {betadiv_calculation} {betadiv_measure} Diagram", width='stretch'):
             beta_diversity_matrix()
         st.divider()
 
@@ -4337,7 +4808,7 @@ if 'df_taxon_table' in st.session_state and 'table_display_name' in st.session_s
             pcoa_color = st.selectbox(label='Select Color Mode:', options=['Color scale', 'Color sequence', 'Single Color'], key='pcoa_color')
             pcoa_groups = st.selectbox(label='Select Grouping Display:', options=['None', 'Outlines', 'Continous'], key='pcoa_groups')
         # --- Action Button 1 ---
-        if st.button(f"🔄 Calculate {pcoa_mode} Dissimilarity PCoA", use_container_width=True):
+        if st.button(f"🔄 Calculate {pcoa_mode} Dissimilarity PCoA", width='stretch'):
             pcoa_df, explained_variance_df, pcoa_distance_matrix_df = pcoa_calculation()
             st.session_state['pcoa_df'] = pcoa_df
             st.session_state['pcoa_distance_matrix_df'] = pcoa_distance_matrix_df
@@ -4352,7 +4823,7 @@ if 'df_taxon_table' in st.session_state and 'table_display_name' in st.session_s
                 st.selectbox(label='Select Y-Axis:', options=st.session_state['pcoa_explained_variance_dict'].keys(), index=1, key='pcoa_y')
             with col3:
                 st.selectbox(label='Select Z-Axis:', options=['None'] + list(st.session_state['pcoa_explained_variance_dict'].keys()), index=0, key='pcoa_z')
-            if st.button(f"🔄 Plot PCoA", use_container_width=True):
+            if st.button(f"🔄 Plot PCoA", width='stretch'):
                 pcoa_plot()
         else:
             st.warning('Please calculate the PCoA first!')
@@ -4372,20 +4843,124 @@ if 'df_taxon_table' in st.session_state and 'table_display_name' in st.session_s
             nmds_groups = st.selectbox(label='Select Grouping Display:', options=['None', 'Outlines', 'Continous'], key='nmds_groups')
             nmds_axes = st.selectbox(label='Select NMDS Dimensions:', options=[2,3], index=0, key='nmds_axes')
         # --- Action Button 1 ---
-        if st.button(f"🔄 Calculate {nmds_mode} Dissimilarity NMDS", use_container_width=True):
+        if st.button(f"🔄 Calculate {nmds_mode} Dissimilarity NMDS", width='stretch'):
             nmds_df, nmds_stress = nmds_calculation()
             st.session_state['nmds_df'] = nmds_df
             st.session_state['nmds_stress'] = nmds_stress
         # --- Action Button 2 ---
         if 'nmds_stress' in st.session_state:
             st.info(f'NMDS stress: {st.session_state["nmds_stress"]:.2}')
-            if st.button(f"🔄 Plot NMDS", use_container_width=True):
+            if st.button(f"🔄 Plot NMDS", width='stretch'):
                 nmds_plot()
         st.divider()
 
     ########################################################################################################################
+    st.markdown("## 🧪 Sample Comparison")
+    with st.expander(expanded=False, label='See more'):
+        st.success(
+            "Use this section to compare your samples based on metadata categories. "
+            "You can generate Venn diagrams to visualize shared and unique taxa between 2–3 groups. "
+            "For more than 3 categories, consider using an UpSet chart instead."
+        )
+
+        st.write('### Venn Diagram')
+        # --- Initialize structure ---
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            venn_metadata = st.selectbox(label='Select Metadata Category:', options=available_metadata, key='venn_metadata')
+            venn_categories = [str(i) for i in st.session_state['df_metadata_table'][venn_metadata].unique() if i != '']
+            st.info(f"Groups: {', '.join(list(venn_categories)[:10])}")
+        with col2:
+            venn_taxon_level = st.selectbox(label='Select taxonomic level:', options=st.session_state['taxa_cols2'], key='venn_taxon_level')
+        with col3:
+            venn_weighted = st.selectbox(label='Weighted Circle Sizes:', options=['Weighted', 'Non-weighted'], key='venn_weighted')
+            venn_display = st.selectbox(label='Display Values:', options=['Values', 'Rel. Values', 'Both'], key='venn_display')
+        # --- Action Button ---
+        if len(venn_categories) >= 4:
+            st.error('Please choose a Metadata with 2-3 Categories! Use an UpSet Chart instead!')
+        elif st.button(f"🔄 Generate Venn{len(venn_categories)} Diagram", width='stretch'):
+            venn_diagram()
+        st.divider()
+
+    ########################################################################################################################
+    st.markdown("## 🔍 Population Dynamics")
+    with st.expander(expanded=False, label='See more'):
+        st.success(
+            "Analyze population-level variation in your metabarcoding dataset. "
+            "Haplotype distribution plots allow you to examine how genetic variants within a taxon "
+            "are distributed across samples, providing insights into population structure and diversity."
+        )
+
+        st.write('### Haplotype Distribution Plot')
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            haplotype_level = st.selectbox(label='Select Taxonomic Level:', options=st.session_state['taxa_cols'], index=6, key='haplotype_level')
+        with col2:
+            available_taxa = sorted([i for i in st.session_state['df_taxon_table'][haplotype_level].unique() if i != ''])
+            haplotype_taxa = st.multiselect(label='Select Taxa:', options=available_taxa, default=available_taxa, key='haplotype_taxa')
+        with col3:
+            haplotype_mode = st.selectbox(label='Select Display Mode:', options=['Bar', 'Scatter'], key='haplotype_mode')
+
+        if st.button(f"🔄 Generate Haplotype Distribution Plot", width='stretch'):
+            haplotype_distribution()
+        st.divider()
+
+    ########################################################################################################################
+    st.markdown("## 📍 Biogeography")
+    with st.expander(expanded=False, label='See more'):
+        st.success(
+            "Explore the biogeographic patterns of your metabarcoding data by visualizing sampling sites and taxon distributions on interactive maps. "
+            "The GBIF Occurrence Validation compares detected taxa with known occurrence records within a defined radius around each sampling site. "
+            "You can also generate distribution maps to examine how reads or relative abundances of selected taxa vary across sampling locations."
+        )
+
+        cols = st.session_state['df_metadata_table'].columns.tolist()
+        if "Latitude" in cols and "Longitude" in cols:
+            st.write('### GBIF Occurrence Validation')
+            col1, col2 ,col3 = st.columns(3)
+            with col1:
+                available_map_styles = ["outdoors", "open-street-map", "carto-positron", "carto-darkmatter"]
+                map_style = st.selectbox(label='Select Map Style:', options=available_map_styles, index=2, key='map_style')
+                map_save = st.selectbox(label='Save Map as PDF and HTML:', options=['Yes', 'No'], index=1, key='map_save')
+            with col2:
+                map_color = st.selectbox(label='Select Color Mode:', options=['Color Scale', 'Color Sequence', 'Single Color'], index=2, key='map_color')
+                map_groups = st.selectbox(label='Select Color Group:', options=['Samples'] + available_metadata, key='map_groups')
+            with col3:
+                sample_radius = st.number_input(label='Select Sample Radius:', value=20, min_value=0, max_value=1000, key='sample_radius')
+                map_zoom = st.number_input(label='Select Map Zoom:', value=6, min_value=1, max_value=15, key='map_zoom')
+            if st.button(f"🔄 Run GBIF Occurrence Validation", width='stretch'):
+                gbif_occurrence_validation()
+            sample_map()
+            st.divider()
+
+            st.write('### Taxon Distribution Maps')
+            col1, col2 ,col3 = st.columns(3)
+            with col1:
+                available_map_styles = ["outdoors", "open-street-map", "carto-positron", "carto-darkmatter"]
+                distmap_style = st.selectbox(label='Select Map Style:', options=available_map_styles, index=2, key='distmap_style')
+                distmap_save = st.selectbox(label='Save Map as PDF and HTML:', options=['Yes', 'No'], index=1, key='distmap_save')
+            with col2:
+                distmap_level = st.selectbox(label='Select Taxonomic Level:', options=st.session_state['taxa_cols'], index=6, key='distmap_level')
+                available_taxa = sorted([i for i in st.session_state['df_taxon_table'][distmap_level].unique() if i != ''])
+                distmap_taxon = st.selectbox(label='Select Taxon:', options=available_taxa, key='distmap_taxon')
+            with col3:
+                distmap_measure = st.selectbox(label='Select Measure:', options=['Rel. Reads', st.session_state['TTT_hash']], key='distmap_measure')
+                distmap_zoom = st.number_input(label='Select Map Zoom:', value=6, min_value=1, max_value=15, key='distmap_zoom')
+            taxon_distribution_map()
+            st.divider()
+
+        else:
+            st.info('Please add the columns "Latitude" and "Longitude" to your Metadata Table!')
+
+    ########################################################################################################################
     st.markdown("## 📆 Time Series")
     with st.expander(expanded=False, label='See more'):
+        st.success(
+            "Visualize how taxon richness changes over time or across sample groups. "
+            "This time series analysis allows you to assess trends, detect seasonal patterns, or monitor experimental changes. "
+            "Confidence intervals and bootstrap repetitions can be adjusted to quantify uncertainty in richness estimates."
+        )
+
         st.write('### Richness Over Time')
         # --- Initialize structure ---
         col1, col2, col3 = st.columns(3)
@@ -4399,25 +4974,40 @@ if 'df_taxon_table' in st.session_state and 'table_display_name' in st.session_s
 
         st.info(f'Samples will be sorted on the X-axis according to the metadata table "Samples" column order: {",".join(df_samples[:3])} ... ')
         # --- Action Button 1 ---
-        if st.button(f"🔄 Calculate Richness Over Time", use_container_width=True):
+        if st.button(f"🔄 Calculate Richness Over Time", width='stretch'):
             time_series_richness()
 
     ########################################################################################################################
     st.markdown("## 🌿 GBIF Modules")
     with st.expander(expanded=False, label='See more'):
+        st.success(
+            "The GBIF modules allow you to integrate your metabarcoding dataset with GBIF species data and tools. "
+            "You can download occurrence records, enrich your taxon table, and prepare data for submission to GBIF. "
+            "Ensure that your dataset meets the listed requirements to guarantee accurate processing and compatibility with GBIF workflows."
+        )
+
         st.write('### GBIF Data')
         st.info("Download GBIF species data and enrich the taxon table.")
-        if st.button("🔄 Add GBIF Data", use_container_width=True):
+        if st.button("🔄 Add GBIF Data", width='stretch'):
             gbif_accession()
         st.divider()
 
         st.write('### GBIF Metabarcoding Data Toolkit')
-        col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns(3)
         with col1:
-            gbif_dataset_requirements = st.checkbox(label='I have read the dataset requirements', value=False,key='gbif_dataset_requirements')
+            gbif_target_gene = st.text_input('Target Gene:', value='', key='gbif_target_gene')
+            gbif_date = st.selectbox(label='Select Collection Date Column from Metadata:', options=['None'] + available_metadata, key='gbif_date')
+            st.write('')
+            gbif_dataset_requirements = st.checkbox(label='**I have read the dataset requirements**.', value=False,
+                                                    key='gbif_dataset_requirements')
         with col2:
-            if st.button(label='🔗 GBIF Metabarcoding Data Toolkit (Test Environment)', use_container_width=True):
-                webbrowser.open('https://mdt.gbif-test.org/dataset/new')
+            gbif_fwd_primer_name = st.text_input('Forward Primer Name:', value='', key='gbif_fwd_primer_name')
+            gbif_fwd_primer_seq = st.text_input('Forward Primer Seq:', value='', key='gbif_fwd_primer_seq')
+            gbif_lat = st.selectbox(label='Select Latitiude Column from Metadata:', options=['None'] + available_metadata, key='gbif_lat')
+        with col3:
+            gbif_rvs_primer = st.text_input('Forward Primer Name:', value='', key='gbif_rvs_primer_name')
+            gbif_rvs_primer_seq = st.text_input('Forward Primer Seq:', value='', key='gbif_rvs_primer_seq')
+            gbif_lon = st.selectbox(label='Select Longitude Column from Metadata:', options=['None'] + available_metadata, key='gbif_lon')
 
         if gbif_dataset_requirements == False:
             st.markdown("""
@@ -4443,16 +5033,26 @@ if 'df_taxon_table' in st.session_state and 'table_display_name' in st.session_s
               Contaminant or unreliable detections (**OTUs/species/taxa**) are identified and can be excluded, for example by removing them from the **Taxonomy table**.
             """)
 
-        if st.button("🔄 Convert Taxon Table to GBIF Upload", use_container_width=True):
+        if st.button("🔄 Convert Taxon Table to GBIF Upload", width='stretch'):
             if gbif_dataset_requirements == True:
                 gbif_upload_conversion()
             else:
                 st.info('Please read the GBIF dataset requirements first!')
 
+        if st.button(label='🔗 GBIF Metabarcoding Data Toolkit (Test Environment)', width='stretch'):
+            webbrowser.open('https://mdt.gbif-test.org/dataset/new')
+
+        st.divider()
 
     ########################################################################################################################
     st.markdown("## 🇪🇺 Ecological Status Classes")
     with st.expander(expanded=False, label='See more'):
+        st.success(
+            "This section allows you to calculate widely used ecological status indices for freshwater ecosystems. "
+            "You can compute the **European Fish Index (EFI)** and **Diathor Index**, as well as convert your taxon table into formats compatible with **Perlodes** and **Phylib** online tools. "
+            "These indices help assess biodiversity, ecological quality, and ecosystem health based on species composition and abundance."
+        )
+
         st.write('### European Fish Index')
         # --- Initialize structure ---
         col1, col2, col3 = st.columns(3)
@@ -4471,7 +5071,7 @@ if 'df_taxon_table' in st.session_state and 'table_display_name' in st.session_s
             efi_map = efi_table / 'WFD_conversion', 'efi_ecoregions.png'
 
         # --- Action Button ---
-        if st.button(f"🔄 Calculate EFI", use_container_width=True):
+        if st.button(f"🔄 Calculate EFI", width='stretch'):
             calculate_efi_index()
         st.divider()
 
@@ -4485,7 +5085,7 @@ if 'df_taxon_table' in st.session_state and 'table_display_name' in st.session_s
         with col3:
             pass
         # --- Action Button ---
-        if st.button(f"🔄 Calculate Diathor Index", use_container_width=True):
+        if st.button(f"🔄 Calculate Diathor Index", width='stretch'):
             calculate_diathor_index()
         st.divider()
 
@@ -4497,10 +5097,10 @@ if 'df_taxon_table' in st.session_state and 'table_display_name' in st.session_s
         with col2:
             st.write('')
             st.write('')
-            if st.button("🔗 Perlode Online Calculation", use_container_width=True):
+            if st.button("🔗 Perlode Online Calculation", width='stretch'):
                 pass
         # --- Action Button ---
-        if st.button(f"🔄 Convert To Perlodes", use_container_width=True):
+        if st.button(f"🔄 Convert To Perlodes", width='stretch'):
             st.info('Coming soon!')
         st.divider()
 
@@ -4512,12 +5112,13 @@ if 'df_taxon_table' in st.session_state and 'table_display_name' in st.session_s
         with col2:
             st.write('')
             st.write('')
-            if st.button("🔗 Phylib Online Calculation", use_container_width=True):
+            if st.button("🔗 Phylib Online Calculation", width='stretch'):
                 pass
         # --- Action Button ---
-        if st.button(f"🔄 Convert To Phylib", use_container_width=True):
+        if st.button(f"🔄 Convert To Phylib", width='stretch'):
             st.info('Coming soon!')
         st.divider()
+
 else:
     st.write('')
     st.warning('Please Load a Taxon Table to continue!')

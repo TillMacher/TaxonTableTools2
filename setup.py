@@ -5,7 +5,7 @@ with open("README.md", "r") as fh:
 
 setuptools.setup(
     name="taxontabletools2",
-    version="2.3.0",
+    version="2.3.2",
     author="Till-Hendrik Macher",
     author_email="macher@uni-trier.de",
     description="Taxontabletools2 - A comprehensive, platform-independent graphical user interface software to explore and visualise DNA metabarcoding data",
@@ -17,6 +17,8 @@ setuptools.setup(
     install_requires=[
         "streamlit",
         "stqdm",
+        "pygbif",
+        "geopandas",
         "scikit-learn",
         "xlsxwriter",
         "pycirclize",
