@@ -26,7 +26,7 @@ will continue to improve throughout 2026.
 Bug reports, feature requests, and suggestions are highly welcome.
 
 ## Requirements
-* Python3.12 or higher
+* Python3.10 or higher
 * Miniconda (recommended)
 * Windows (W10 or W11)
 * macOS (M1 or M2)
