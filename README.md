@@ -32,7 +32,7 @@ Bug reports, feature requests, and suggestions are highly welcome.
 * macOS (M1 or M2)
 * Linux requires a manual installation via pip
 
-## Installation
+## Conda Installation (recommended)
 
 1.  Download and install [Miniconda](https://www.anaconda.com/download/success)
 
@@ -64,6 +64,29 @@ environment.
    ```
 
 Your browser will automatically open the graphical user interface.
+
+## Manual pip Installation
+
+1. Install python 3.10 or higher (conda environment is recommended)
+
+2. Install taxontabletool2 via pip
+   ```sh
+   pip install taxontabletools2
+   ```
+
+3. Install [scikit-bio](https://scikit.bio/install.html)
+   ```sh
+   conda install -c conda-forge scikit-bio
+   ```
+   OR
+   ```sh
+   pip install scikit-bio
+   ```
+
+4. Start TaxonTableTools2
+   ```sh
+   taxontabletools2
+   ```
 
 ## Tutorial
 
